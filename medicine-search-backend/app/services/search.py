@@ -514,79 +514,103 @@ async def search_medicines_postgres(
     1. Medicine Name (Top priority: Exact, Prefix, Alias, Token, Typo)
     2. Composition (Middle priority: Prefix, Substring, Fuzzy)
     3. Company / Manufacturer (Bottom priority: Prefix, Substring, Fuzzy)
+
+    Each parameter's results are collected into a separate bucket, sorted internally
+    by name-similarity to the query (closest match first), then concatenated strictly:
+    name_bucket → composition_bucket → manufacturer_bucket.
     """
-    results: list[SearchResult] = []
     seen_ids: set[str] = set()
+    name_bucket: list[SearchResult] = []
+    comp_bucket: list[SearchResult] = []
+    mfr_bucket: list[SearchResult] = []
 
-    def add_rows(rows, match_param: str):
-        for row in rows:
-            if row.medicine_id not in seen_ids:
-                seen_ids.add(row.medicine_id)
-                results.append(
-                    SearchResult(
-                        medicine_id=row.medicine_id,
-                        source_id=row.source_id,
-                        name=row.name,
-                        manufacturer_name=row.manufacturer_name,
-                        composition=row.composition,
-                        pack_size_label=row.pack_size_label,
-                        price=row.price,
-                        is_discontinued=row.is_discontinued,
-                        match_parameter=getattr(row, "match_parameter", match_param),
-                        match_reason=row.match_reason,
-                        score=round(row.score, 4),
-                    )
-                )
+    def make_and_add(row, bucket: list, match_param: str):
+        """Create a SearchResult and add to the given bucket if not already seen."""
+        if row.medicine_id in seen_ids:
+            return
+        seen_ids.add(row.medicine_id)
+        bucket.append(
+            SearchResult(
+                medicine_id=row.medicine_id,
+                source_id=row.source_id,
+                name=row.name,
+                manufacturer_name=row.manufacturer_name,
+                composition=row.composition,
+                pack_size_label=row.pack_size_label,
+                price=row.price,
+                is_discontinued=row.is_discontinued,
+                match_parameter=getattr(row, "match_parameter", match_param),
+                match_reason=row.match_reason,
+                score=round(row.score, 4),
+            )
+        )
+
+    def name_sim(r: SearchResult) -> float:
+        """Name-similarity of the medicine name to the user query (higher = better)."""
+        return difflib.SequenceMatcher(None, q_norm, r.name.lower()).ratio()
+
+    def sort_bucket(bucket: list[SearchResult]) -> list[SearchResult]:
+        """
+        Sort within a bucket:
+          1. Score DESC  (exact > prefix > token > typo within name tier)
+          2. Name-similarity DESC  (name closest to query string first)
+          3. Name length ASC  (shorter / simpler name first)
+        """
+        bucket.sort(key=lambda r: (-r.score, -name_sim(r), len(r.name)))
+        return bucket
 
     # ──────────────────────────────────────────────────────────
-    # PARAMETER 1: MEDICINE NAME (Scores: 0.75 - 1.00)
+    # PARAMETER 1: MEDICINE NAME
     # ──────────────────────────────────────────────────────────
-    
+
     # 1A. Exact Name Match (<0.5ms via B-Tree)
     exact_res = await session.execute(PG_EXACT_NAME_QUERY, {"q": q_norm, "limit": limit})
-    add_rows(exact_res.fetchall(), "name")
+    for row in exact_res.fetchall():
+        make_and_add(row, name_bucket, "name")
 
-    if results and results[0].match_reason == "exact_name" and len(results) >= limit:
-        return results[:limit]
+    if name_bucket and name_bucket[0].match_reason == "exact_name" and len(name_bucket) >= limit:
+        return name_bucket[:limit]
 
     # 1B. Prefix Name Match
-    remaining = limit - len(results)
+    remaining = limit - len(name_bucket)
     if remaining > 0:
         existing_list = list(seen_ids) if seen_ids else None
         prefix_res = await session.execute(
             PG_PREFIX_NAME_QUERY,
             {"q": q_norm, "remaining": remaining, "existing_ids": existing_list},
         )
-        add_rows(prefix_res.fetchall(), "name")
+        for row in prefix_res.fetchall():
+            make_and_add(row, name_bucket, "name")
 
     # 1C. Exact & Prefix Name Alias Match
-    remaining = limit - len(results)
+    remaining = limit - len(name_bucket)
     if remaining > 0:
         existing_list = list(seen_ids) if seen_ids else None
         alias_res = await session.execute(
             PG_ALIAS_QUERY,
             {"q": q_norm, "remaining": remaining, "existing_ids": existing_list},
         )
-        add_rows(alias_res.fetchall(), "name")
+        for row in alias_res.fetchall():
+            make_and_add(row, name_bucket, "name")
 
     # 1D. Word / Token Match on Name
-    remaining = limit - len(results)
+    remaining = limit - len(name_bucket)
     if remaining > 0 and len(q_norm) >= 3:
         existing_list = list(seen_ids) if seen_ids else None
         token_res = await session.execute(
             PG_TOKEN_NAME_QUERY,
             {"q": q_norm, "remaining": remaining, "existing_ids": existing_list},
         )
-        add_rows(token_res.fetchall(), "name")
+        for row in token_res.fetchall():
+            make_and_add(row, name_bucket, "name")
 
-    # 1E. Fuzzy / Typo Match on Name (Handles typos like "pantoseb" -> "pantosec")
-    remaining = limit - len(results)
+    # 1E. Fuzzy / Typo Match on Name
+    remaining = limit - len(name_bucket)
     if remaining > 0 and len(q_norm) >= 3:
         existing_list = list(seen_ids) if seen_ids else None
         words = re.findall(r"[a-z]+", q_norm)
         numbers = re.findall(r"\d+", q_norm)
 
-        # Decomposed brand + strength
         if words and numbers:
             brand_q = " ".join(words)
             num_q = numbers[0]
@@ -600,84 +624,91 @@ async def search_medicines_postgres(
                     "existing_ids": existing_list,
                 },
             )
-            add_rows(fuzzy_decomp_res.fetchall(), "name")
+            for row in fuzzy_decomp_res.fetchall():
+                make_and_add(row, name_bucket, "name")
 
-        # Standard trigram fuzzy on name
-        remaining = limit - len(results)
+        remaining = limit - len(name_bucket)
         if remaining > 0:
             existing_list = list(seen_ids) if seen_ids else None
             fuzzy_name_res = await session.execute(
                 PG_FUZZY_NAME_QUERY,
-                {
-                    "q": q_norm,
-                    "remaining": remaining,
-                    "existing_ids": existing_list,
-                },
+                {"q": q_norm, "remaining": remaining, "existing_ids": existing_list},
             )
-            add_rows(fuzzy_name_res.fetchall(), "name")
+            for row in fuzzy_name_res.fetchall():
+                make_and_add(row, name_bucket, "name")
 
-    # If Name matches satisfy requested limit, RETURN IMMEDIATELY!
-    # (Ensures zero composition or company pollution when user wanted name)
-    if len(results) >= limit:
-        results.sort(key=lambda x: x.score, reverse=True)
-        return results[:limit]
+    # Sort name bucket: score DESC → name-similarity DESC → name-length ASC
+    sort_bucket(name_bucket)
+
+    # If Name bucket fills the limit → return immediately (no comp/company pollution)
+    if len(name_bucket) >= limit:
+        return name_bucket[:limit]
 
     # ──────────────────────────────────────────────────────────
-    # PARAMETER 2: COMPOSITION (Scores: 0.55 - 0.70)
+    # PARAMETER 2: COMPOSITION
     # (Only executed if Name matches didn't completely fill limit)
     # ──────────────────────────────────────────────────────────
-    remaining = limit - len(results)
+    remaining = limit - len(name_bucket)
     if remaining > 0 and len(q_norm) >= 3:
         existing_list = list(seen_ids) if seen_ids else None
-        
+
         # 2A. Prefix on composition
         comp_prefix_res = await session.execute(
             PG_PREFIX_COMPOSITION_QUERY,
             {"q": q_norm, "remaining": remaining, "existing_ids": existing_list},
         )
-        add_rows(comp_prefix_res.fetchall(), "composition")
+        for row in comp_prefix_res.fetchall():
+            make_and_add(row, comp_bucket, "composition")
 
         # 2B. Fuzzy / Substring on composition
-        remaining = limit - len(results)
+        remaining = limit - len(name_bucket) - len(comp_bucket)
         if remaining > 0 and len(q_norm) >= 4:
             existing_list = list(seen_ids) if seen_ids else None
             comp_fuzzy_res = await session.execute(
                 PG_FUZZY_COMPOSITION_QUERY,
                 {"q": q_norm, "remaining": remaining, "existing_ids": existing_list},
             )
-            add_rows(comp_fuzzy_res.fetchall(), "composition")
+            for row in comp_fuzzy_res.fetchall():
+                make_and_add(row, comp_bucket, "composition")
 
-    if len(results) >= limit:
-        results.sort(key=lambda x: x.score, reverse=True)
-        return results[:limit]
+    # Sort composition bucket by name-similarity to query
+    sort_bucket(comp_bucket)
+
+    if len(name_bucket) + len(comp_bucket) >= limit:
+        return (name_bucket + comp_bucket)[:limit]
 
     # ──────────────────────────────────────────────────────────
-    # PARAMETER 3: COMPANY / MANUFACTURER (Scores: 0.35 - 0.50)
+    # PARAMETER 3: COMPANY / MANUFACTURER
     # (Only executed if Name + Composition matches < limit)
     # ──────────────────────────────────────────────────────────
-    remaining = limit - len(results)
+    remaining = limit - len(name_bucket) - len(comp_bucket)
     if remaining > 0 and len(q_norm) >= 3:
         existing_list = list(seen_ids) if seen_ids else None
-        
+
         # 3A. Prefix on manufacturer
         mfr_prefix_res = await session.execute(
             PG_PREFIX_MANUFACTURER_QUERY,
             {"q": q_norm, "remaining": remaining, "existing_ids": existing_list},
         )
-        add_rows(mfr_prefix_res.fetchall(), "manufacturer")
+        for row in mfr_prefix_res.fetchall():
+            make_and_add(row, mfr_bucket, "manufacturer")
 
         # 3B. Fuzzy on manufacturer
-        remaining = limit - len(results)
+        remaining = limit - len(name_bucket) - len(comp_bucket) - len(mfr_bucket)
         if remaining > 0 and len(q_norm) >= 4:
             existing_list = list(seen_ids) if seen_ids else None
             mfr_fuzzy_res = await session.execute(
                 PG_FUZZY_MANUFACTURER_QUERY,
                 {"q": q_norm, "remaining": remaining, "existing_ids": existing_list},
             )
-            add_rows(mfr_fuzzy_res.fetchall(), "manufacturer")
+            for row in mfr_fuzzy_res.fetchall():
+                make_and_add(row, mfr_bucket, "manufacturer")
 
-    results.sort(key=lambda x: x.score, reverse=True)
-    return results[:limit]
+    # Sort manufacturer bucket by name-similarity to query
+    sort_bucket(mfr_bucket)
+
+    # ── Final: strict 3-parameter order — Name → Composition → Manufacturer ──
+    return (name_bucket + comp_bucket + mfr_bucket)[:limit]
 
 
 # ============================================================
@@ -693,58 +724,78 @@ async def search_medicines_sqlite(
 ) -> list[SearchResult]:
     """
     Search medicines on SQLite fallback database strictly adhering to the 3-parameter priority.
+
+    Results are collected into 3 separate buckets:
+      name_bucket → composition_bucket → manufacturer_bucket
+    Each bucket is sorted by name-similarity to the query before concatenation.
     """
-    results: list[SearchResult] = []
     seen_ids: set[str] = set()
+    name_bucket: list[SearchResult] = []
+    comp_bucket: list[SearchResult] = []
+    mfr_bucket: list[SearchResult] = []
 
-    def add_rows(rows, match_param: str):
-        for row in rows:
-            if row.medicine_id not in seen_ids:
-                seen_ids.add(row.medicine_id)
-                results.append(
-                    SearchResult(
-                        medicine_id=row.medicine_id,
-                        source_id=row.source_id,
-                        name=row.name,
-                        manufacturer_name=row.manufacturer_name,
-                        composition=row.composition,
-                        pack_size_label=row.pack_size_label,
-                        price=row.price,
-                        is_discontinued=bool(row.is_discontinued),
-                        match_parameter=getattr(row, "match_parameter", match_param),
-                        match_reason=row.match_reason,
-                        score=round(row.score, 4),
-                    )
-                )
+    def make_and_add(row, bucket: list, match_param: str, *, is_disc: bool | None = None):
+        if row.medicine_id in seen_ids:
+            return
+        seen_ids.add(row.medicine_id)
+        bucket.append(
+            SearchResult(
+                medicine_id=row.medicine_id,
+                source_id=row.source_id,
+                name=row.name,
+                manufacturer_name=row.manufacturer_name,
+                composition=row.composition,
+                pack_size_label=row.pack_size_label,
+                price=row.price,
+                is_discontinued=bool(row.is_discontinued) if is_disc is None else is_disc,
+                match_parameter=getattr(row, "match_parameter", match_param),
+                match_reason=row.match_reason,
+                score=round(row.score, 4),
+            )
+        )
 
-    # 1. PARAMETER 1: MEDICINE NAME
+    def name_sim(r: SearchResult) -> float:
+        return difflib.SequenceMatcher(None, q_norm, r.name.lower()).ratio()
+
+    def sort_bucket(bucket: list[SearchResult]) -> list[SearchResult]:
+        bucket.sort(key=lambda r: (-r.score, -name_sim(r), len(r.name)))
+        return bucket
+
+    # ──────────────────────────────────────────────────
+    # PARAMETER 1: MEDICINE NAME
+    # ──────────────────────────────────────────────────
+
     # 1A. Exact Name
     exact_res = await session.execute(SQLITE_EXACT_NAME_QUERY, {"q": q_norm, "limit": limit})
-    add_rows(exact_res.fetchall(), "name")
+    for row in exact_res.fetchall():
+        make_and_add(row, name_bucket, "name")
 
-    if results and results[0].match_reason == "exact_name" and len(results) >= limit:
-        return results[:limit]
+    if name_bucket and name_bucket[0].match_reason == "exact_name" and len(name_bucket) >= limit:
+        return name_bucket[:limit]
 
     # 1B. Prefix Name
-    remaining = limit - len(results)
+    remaining = limit - len(name_bucket)
     if remaining > 0:
         prefix_res = await session.execute(SQLITE_PREFIX_NAME_QUERY, {"q": q_norm, "remaining": remaining})
-        add_rows(prefix_res.fetchall(), "name")
+        for row in prefix_res.fetchall():
+            make_and_add(row, name_bucket, "name")
 
     # 1C. Exact/Prefix Alias
-    remaining = limit - len(results)
+    remaining = limit - len(name_bucket)
     if remaining > 0:
         alias_res = await session.execute(SQLITE_ALIAS_QUERY, {"q": q_norm, "remaining": remaining})
-        add_rows(alias_res.fetchall(), "name")
+        for row in alias_res.fetchall():
+            make_and_add(row, name_bucket, "name")
 
     # 1D. Token Name
-    remaining = limit - len(results)
+    remaining = limit - len(name_bucket)
     if remaining > 0 and len(q_norm) >= 3:
         token_res = await session.execute(SQLITE_TOKEN_NAME_QUERY, {"q": q_norm, "remaining": remaining})
-        add_rows(token_res.fetchall(), "name")
+        for row in token_res.fetchall():
+            make_and_add(row, name_bucket, "name")
 
     # 1E. Fuzzy/Typo on Name via difflib SequenceMatcher
-    remaining = limit - len(results)
+    remaining = limit - len(name_bucket)
     if remaining > 0:
         words = re.findall(r"[a-z]+", q_norm)
         numbers = re.findall(r"\d+", q_norm)
@@ -769,10 +820,11 @@ async def search_medicines_sqlite(
             if sim >= 0.35:
                 scored_candidates.append((cand, sim))
 
-        scored_candidates.sort(key=lambda x: x[1], reverse=True)
+        # Sort by similarity DESC, then name length ASC for tie-breaking
+        scored_candidates.sort(key=lambda x: (-x[1], len(x[0].name)))
         for cand, sim in scored_candidates[:remaining]:
             seen_ids.add(cand.medicine_id)
-            results.append(
+            name_bucket.append(
                 SearchResult(
                     medicine_id=cand.medicine_id,
                     source_id=cand.source_id,
@@ -788,35 +840,47 @@ async def search_medicines_sqlite(
                 )
             )
 
-    # If Name matches fulfill limit, return immediately!
-    if len(results) >= limit:
-        results.sort(key=lambda x: x.score, reverse=True)
-        return results[:limit]
+    # Sort name bucket: score DESC → name-similarity DESC → name-length ASC
+    sort_bucket(name_bucket)
 
-    # 2. PARAMETER 2: COMPOSITION
-    remaining = limit - len(results)
+    # If Name bucket fills the limit → return immediately!
+    if len(name_bucket) >= limit:
+        return name_bucket[:limit]
+
+    # ──────────────────────────────────────────────────
+    # PARAMETER 2: COMPOSITION
+    # ──────────────────────────────────────────────────
+    remaining = limit - len(name_bucket)
     if remaining > 0 and len(q_norm) >= 3:
         comp_res = await session.execute(
             SQLITE_PREFIX_COMPOSITION_QUERY,
             {"q": q_norm, "remaining": remaining},
         )
-        add_rows(comp_res.fetchall(), "composition")
+        for row in comp_res.fetchall():
+            make_and_add(row, comp_bucket, "composition")
 
-    if len(results) >= limit:
-        results.sort(key=lambda x: x.score, reverse=True)
-        return results[:limit]
+    sort_bucket(comp_bucket)
 
-    # 3. PARAMETER 3: COMPANY / MANUFACTURER
-    remaining = limit - len(results)
+    if len(name_bucket) + len(comp_bucket) >= limit:
+        return (name_bucket + comp_bucket)[:limit]
+
+    # ──────────────────────────────────────────────────
+    # PARAMETER 3: COMPANY / MANUFACTURER
+    # ──────────────────────────────────────────────────
+    remaining = limit - len(name_bucket) - len(comp_bucket)
     if remaining > 0 and len(q_norm) >= 3:
         mfr_res = await session.execute(
             SQLITE_PREFIX_MANUFACTURER_QUERY,
             {"q": q_norm, "remaining": remaining},
         )
-        add_rows(mfr_res.fetchall(), "manufacturer")
+        for row in mfr_res.fetchall():
+            make_and_add(row, mfr_bucket, "manufacturer")
 
-    results.sort(key=lambda x: x.score, reverse=True)
-    return results[:limit]
+    sort_bucket(mfr_bucket)
+
+    # Final: strict 3-parameter order — Name → Composition → Manufacturer
+    return (name_bucket + comp_bucket + mfr_bucket)[:limit]
+
 
 
 # ============================================================
