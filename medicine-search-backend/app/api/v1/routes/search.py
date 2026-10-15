@@ -47,6 +47,7 @@ async def search(
             pack_size=r.pack_size_label,
             price=r.price,
             is_discontinued=r.is_discontinued,
+            match_parameter=getattr(r, "match_parameter", "name"),
             match_reason=r.match_reason,
             score=r.score,
             # Per plan: not selectable if discontinued; full eligibility gate in Phase 2

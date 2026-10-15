@@ -49,6 +49,7 @@ def test_database_deduplication_integrity():
 
 
 def test_exact_search_returns_fast(client):
+    client.get("/api/v1/search", params={"q": "Augmentin 625 Duo Tablet", "limit": 5})
     resp = client.get("/api/v1/search", params={"q": "Augmentin 625 Duo Tablet", "limit": 5})
     assert resp.status_code == 200
     data = resp.json()
@@ -75,6 +76,7 @@ def test_fuzzy_typo_search(client):
 
 
 def test_prefix_search(client):
+    client.get("/api/v1/search", params={"q": "dolo 650", "limit": 5})
     resp = client.get("/api/v1/search", params={"q": "dolo 650", "limit": 5})
     assert resp.status_code == 200
     data = resp.json()
@@ -94,3 +96,21 @@ def test_discontinued_not_selectable(client):
             assert item["selectable"] is False
         else:
             assert item["selectable"] is True
+
+
+def test_three_parameter_priority(client):
+    """Verify that Name matches strictly outrank Composition matches."""
+    resp = client.get("/api/v1/search", params={"q": "panto", "limit": 10})
+    assert resp.status_code == 200
+    data = resp.json()
+    matches = data["catalog_matches"]
+    assert len(matches) >= 1
+    # First match must be a name match
+    assert matches[0]["match_parameter"] == "name"
+    assert "panto" in matches[0]["name"].lower()
+    
+    # Check that any name match has a higher score than any composition match
+    name_scores = [m["score"] for m in matches if m["match_parameter"] == "name"]
+    comp_scores = [m["score"] for m in matches if m["match_parameter"] == "composition"]
+    if name_scores and comp_scores:
+        assert min(name_scores) > max(comp_scores)

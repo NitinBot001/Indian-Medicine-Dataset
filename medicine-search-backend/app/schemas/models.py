@@ -15,8 +15,12 @@ class MedicineMatch(BaseModel):
     pack_size: str | None = None
     price: float | None = None
     is_discontinued: bool = False
+    match_parameter: str = Field(
+        default="name",
+        description="Search parameter matched: 'name', 'composition', or 'manufacturer'"
+    )
     match_reason: str = Field(
-        description="Why this result matched: exact_name, exact_alias, prefix, typo_match, composition_match"
+        description="Detailed match reason: exact_name, exact_alias, prefix, token_match, typo_match, composition_match, manufacturer_match"
     )
     score: float = Field(ge=0.0, le=1.0, description="Relevance score 0-1")
     selectable: bool = Field(
