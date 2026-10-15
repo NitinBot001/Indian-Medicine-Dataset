@@ -61,5 +61,7 @@ class HealthResponse(BaseModel):
     """Health check response."""
     status: str = "ok"
     database: str = "connected"
+    database_dialect: str = "postgresql"
+    is_fallback: bool = False
     catalog_version: str | None = None
     medicine_count: int = 0

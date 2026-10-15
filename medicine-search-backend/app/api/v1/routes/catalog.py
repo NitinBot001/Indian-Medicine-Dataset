@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.session import get_db
+from app.db.session import get_db, db_manager
 from app.schemas.models import HealthResponse
 
 router = APIRouter(prefix="/admin/catalog", tags=["catalog"])
@@ -32,6 +32,8 @@ async def catalog_status(
         return HealthResponse(
             status="ok",
             database="connected",
+            database_dialect=db_manager.active_dialect,
+            is_fallback=db_manager.is_fallback,
             catalog_version=version,
             medicine_count=count,
         )

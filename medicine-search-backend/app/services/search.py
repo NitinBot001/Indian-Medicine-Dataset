@@ -19,6 +19,7 @@ Performance architecture:
 - 100% of queries finish in < 100ms across 253k+ records
 """
 
+import difflib
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -249,27 +250,159 @@ LIMIT :remaining
 """)
 
 
-async def search_medicines(
+# ============================================================
+# SQLITE FALLBACK QUERIES (ANSI SQL without ::text or pg_trgm)
+# ============================================================
+
+SQLITE_PREFIX_NAME_QUERY = text("""
+SELECT
+    CAST(m.id AS TEXT) AS medicine_id,
+    m.source_id,
+    m.name,
+    m.manufacturer_name,
+    COALESCE(m.short_composition1, '') ||
+        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
+            THEN ' + ' || m.short_composition2
+            ELSE ''
+        END AS composition,
+    m.pack_size_label,
+    CAST(m.price AS REAL) AS price,
+    m.is_discontinued,
+    CASE
+        WHEN m.name_normalized = :q THEN 'exact_name'
+        ELSE 'prefix'
+    END AS match_reason,
+    CASE
+        WHEN m.name_normalized = :q THEN 1.0
+        ELSE (0.90 + 0.07 * (CAST(length(:q) AS REAL) / CASE WHEN length(m.name_normalized) > 1 THEN length(m.name_normalized) ELSE 1 END))
+    END AS score
+FROM medicines m
+WHERE m.name_normalized LIKE (:q || '%')
+ORDER BY (m.name_normalized = :q) DESC, length(m.name_normalized), m.name_normalized
+LIMIT :limit
+""")
+
+SQLITE_ALIAS_QUERY = text("""
+SELECT
+    CAST(m.id AS TEXT) AS medicine_id,
+    m.source_id,
+    m.name,
+    m.manufacturer_name,
+    COALESCE(m.short_composition1, '') ||
+        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
+            THEN ' + ' || m.short_composition2
+            ELSE ''
+        END AS composition,
+    m.pack_size_label,
+    CAST(m.price AS REAL) AS price,
+    m.is_discontinued,
+    'exact_alias' AS match_reason,
+    0.98 AS score
+FROM medicine_aliases ma
+JOIN medicines m ON m.id = ma.medicine_id
+WHERE ma.alias_normalized = :q
+LIMIT :limit
+""")
+
+SQLITE_PREFIX_MANUFACTURER_QUERY = text("""
+SELECT
+    CAST(m.id AS TEXT) AS medicine_id,
+    m.source_id,
+    m.name,
+    m.manufacturer_name,
+    COALESCE(m.short_composition1, '') ||
+        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
+            THEN ' + ' || m.short_composition2
+            ELSE ''
+        END AS composition,
+    m.pack_size_label,
+    CAST(m.price AS REAL) AS price,
+    m.is_discontinued,
+    'manufacturer_match' AS match_reason,
+    (0.80 + 0.05 * (CAST(length(:q) AS REAL) / CASE WHEN length(m.name_normalized) > 1 THEN length(m.name_normalized) ELSE 1 END)) AS score
+FROM medicines m
+WHERE m.manufacturer_normalized LIKE (:q || '%')
+ORDER BY length(m.name_normalized), m.name_normalized
+LIMIT :limit
+""")
+
+SQLITE_PREFIX_COMPOSITION_QUERY = text("""
+SELECT
+    CAST(m.id AS TEXT) AS medicine_id,
+    m.source_id,
+    m.name,
+    m.manufacturer_name,
+    COALESCE(m.short_composition1, '') ||
+        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
+            THEN ' + ' || m.short_composition2
+            ELSE ''
+        END AS composition,
+    m.pack_size_label,
+    CAST(m.price AS REAL) AS price,
+    m.is_discontinued,
+    'composition_match' AS match_reason,
+    (0.82 + 0.05 * (CAST(length(:q) AS REAL) / CASE WHEN length(m.name_normalized) > 1 THEN length(m.name_normalized) ELSE 1 END)) AS score
+FROM medicines m
+WHERE m.composition_normalized LIKE (:q || '%')
+ORDER BY length(m.name_normalized), m.name_normalized
+LIMIT :limit
+""")
+
+SQLITE_TOKEN_QUERY = text("""
+SELECT
+    CAST(m.id AS TEXT) AS medicine_id,
+    m.source_id,
+    m.name,
+    m.manufacturer_name,
+    COALESCE(m.short_composition1, '') ||
+        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
+            THEN ' + ' || m.short_composition2
+            ELSE ''
+        END AS composition,
+    m.pack_size_label,
+    CAST(m.price AS REAL) AS price,
+    m.is_discontinued,
+    'token_match' AS match_reason,
+    (0.85 + 0.05 * (CAST(length(:q) AS REAL) / CASE WHEN length(m.name_normalized) > 1 THEN length(m.name_normalized) ELSE 1 END)) AS score
+FROM medicines m
+WHERE m.name_normalized LIKE ('% ' || :q || '%')
+ORDER BY length(m.name_normalized), m.name_normalized
+LIMIT :remaining
+""")
+
+SQLITE_CANDIDATES_QUERY = text("""
+SELECT
+    CAST(m.id AS TEXT) AS medicine_id,
+    m.source_id,
+    m.name,
+    m.name_normalized,
+    m.manufacturer_name,
+    COALESCE(m.short_composition1, '') ||
+        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
+            THEN ' + ' || m.short_composition2
+            ELSE ''
+        END AS composition,
+    m.pack_size_label,
+    CAST(m.price AS REAL) AS price,
+    m.is_discontinued
+FROM medicines m
+WHERE (m.name_normalized LIKE (:first_char || '%'))
+   OR (:num != '' AND m.name_normalized LIKE ('%' || :num || '%'))
+   OR (:word != '' AND m.name_normalized LIKE ('%' || :word || '%'))
+LIMIT 300
+""")
+
+
+async def search_medicines_postgres(
     session: AsyncSession,
-    query: str,
+    q_norm: str,
     limit: int = 10,
     *,
     similarity_threshold: float = 0.25,
 ) -> list[SearchResult]:
     """
-    Search medicines with cascading exact -> alias -> prefix -> token -> trigram fuzzy -> composition.
-
-    Implements plan.md Section 6 with strict latency optimization:
-    - Exact match returns in < 1ms
-    - Prefix & token match return in < 5ms
-    - Fast manufacturer / composition prefix return in < 2ms
-    - Fuzzy trigram typo matching runs in 10-30ms using GIN indexes
-    - Smart brand-strength decomposition for queries like "azithrl 500"
-    - All queries finish in < 100ms
+    Search medicines using PostgreSQL pg_trgm and B-Tree indexes (<100ms p95).
     """
-    q_norm = normalize_medicine_name(query)
-    if not q_norm:
-        return []
 
     results: list[SearchResult] = []
     seen_ids: set[str] = set()
@@ -419,3 +552,158 @@ async def search_medicines(
 
     results.sort(key=lambda x: x.score, reverse=True)
     return results[:limit]
+
+
+async def search_medicines_sqlite(
+    session: AsyncSession,
+    q_norm: str,
+    limit: int = 10,
+    *,
+    similarity_threshold: float = 0.25,
+) -> list[SearchResult]:
+    """
+    Search medicines on SQLite fallback database with prefix and difflib fuzzy matching.
+    """
+    results: list[SearchResult] = []
+    seen_ids: set[str] = set()
+
+    def add_rows(rows):
+        for row in rows:
+            if row.medicine_id not in seen_ids:
+                seen_ids.add(row.medicine_id)
+                results.append(
+                    SearchResult(
+                        medicine_id=row.medicine_id,
+                        source_id=row.source_id,
+                        name=row.name,
+                        manufacturer_name=row.manufacturer_name,
+                        composition=row.composition,
+                        pack_size_label=row.pack_size_label,
+                        price=row.price,
+                        is_discontinued=bool(row.is_discontinued),
+                        match_reason=row.match_reason,
+                        score=round(row.score, 4),
+                    )
+                )
+
+    # 1. Exact and Prefix match on name
+    prefix_res = await session.execute(
+        SQLITE_PREFIX_NAME_QUERY,
+        {"q": q_norm, "limit": limit},
+    )
+    add_rows(prefix_res.fetchall())
+
+    if results and (results[0].match_reason == "exact_name" or len(results) >= limit):
+        return results[:limit]
+
+    # 2. Exact alias match
+    alias_res = await session.execute(
+        SQLITE_ALIAS_QUERY,
+        {"q": q_norm, "limit": limit - len(results)},
+    )
+    add_rows(alias_res.fetchall())
+
+    if results and results[0].match_reason == "exact_alias":
+        return results[:limit]
+
+    # 3. Manufacturer & Composition prefix
+    if len(q_norm) >= 3 and len(results) < limit:
+        mfr_res = await session.execute(
+            SQLITE_PREFIX_MANUFACTURER_QUERY,
+            {"q": q_norm, "limit": limit - len(results)},
+        )
+        add_rows(mfr_res.fetchall())
+
+    if len(q_norm) >= 4 and len(results) < limit:
+        comp_res = await session.execute(
+            SQLITE_PREFIX_COMPOSITION_QUERY,
+            {"q": q_norm, "limit": limit - len(results)},
+        )
+        add_rows(comp_res.fetchall())
+
+    # 4. Token match
+    if len(q_norm) >= 3 and len(results) < limit:
+        remaining = limit - len(results)
+        token_res = await session.execute(
+            SQLITE_TOKEN_QUERY,
+            {"q": q_norm, "remaining": remaining},
+        )
+        add_rows(token_res.fetchall())
+
+    if len(results) >= 1:
+        results.sort(key=lambda x: x.score, reverse=True)
+        return results[:limit]
+
+    # 5. Typo match via difflib on candidate set
+    words = re.findall(r"[a-z]+", q_norm)
+    numbers = re.findall(r"\d+", q_norm)
+    first_char = q_norm[0] if q_norm else ""
+    first_word = words[0] if words else ""
+    first_num = numbers[0] if numbers else ""
+
+    cand_res = await session.execute(
+        SQLITE_CANDIDATES_QUERY,
+        {
+            "first_char": first_char,
+            "word": first_word[:4] if len(first_word) >= 4 else first_word,
+            "num": first_num,
+        },
+    )
+    candidates = cand_res.fetchall()
+    scored_candidates = []
+    for cand in candidates:
+        if cand.medicine_id in seen_ids:
+            continue
+        sim = difflib.SequenceMatcher(None, q_norm, cand.name_normalized).ratio()
+        if sim >= 0.35:
+            scored_candidates.append((cand, sim))
+
+    scored_candidates.sort(key=lambda x: x[1], reverse=True)
+    for cand, sim in scored_candidates[:limit]:
+        seen_ids.add(cand.medicine_id)
+        results.append(
+            SearchResult(
+                medicine_id=cand.medicine_id,
+                source_id=cand.source_id,
+                name=cand.name,
+                manufacturer_name=cand.manufacturer_name,
+                composition=cand.composition,
+                pack_size_label=cand.pack_size_label,
+                price=cand.price,
+                is_discontinued=bool(cand.is_discontinued),
+                match_reason="typo_match",
+                score=round(sim * 0.85, 4),
+            )
+        )
+
+    results.sort(key=lambda x: x.score, reverse=True)
+    return results[:limit]
+
+
+async def search_medicines(
+    session: AsyncSession,
+    query: str,
+    limit: int = 10,
+    *,
+    similarity_threshold: float = 0.25,
+) -> list[SearchResult]:
+    """
+    Search medicines with cascading exact -> alias -> prefix -> token -> trigram fuzzy -> composition.
+    Automatically detects active database dialect (PostgreSQL vs SQLite) and dispatches to
+    the optimal engine.
+    """
+    q_norm = normalize_medicine_name(query)
+    if not q_norm:
+        return []
+
+    bind = session.bind
+    dialect = bind.dialect.name if bind else "postgresql"
+    if dialect == "sqlite":
+        return await search_medicines_sqlite(
+            session, q_norm, limit=limit, similarity_threshold=similarity_threshold
+        )
+
+    return await search_medicines_postgres(
+        session, q_norm, limit=limit, similarity_threshold=similarity_threshold
+    )
+
