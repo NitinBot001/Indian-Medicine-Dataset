@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS medicines (
     salt_composition TEXT,
     catalog_version_id UUID REFERENCES catalog_versions(id),
     source_hash VARCHAR(64),
+    product_identity_hash VARCHAR(64) UNIQUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -144,6 +145,10 @@ CREATE INDEX IF NOT EXISTS idx_medicine_manufacturer_prefix
 
 CREATE INDEX IF NOT EXISTS idx_medicine_composition_prefix
     ON medicines (composition_normalized varchar_pattern_ops);
+
+-- Unique index for product deduplication (guarantees no duplicate medicines)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_medicine_product_identity_unique
+    ON medicines (product_identity_hash);
 
 -- GiST index for fast KNN typo ordering and token search
 CREATE INDEX IF NOT EXISTS idx_medicine_name_gist

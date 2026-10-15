@@ -57,6 +57,22 @@ def compute_row_hash(row: dict) -> str:
     return hashlib.md5(content.encode()).hexdigest()
 
 
+def compute_product_identity_hash(
+    name_normalized: str,
+    manufacturer_normalized: str | None,
+    pack_size_label: str | None,
+    composition_normalized: str | None,
+) -> str:
+    """
+    Compute deterministic 32-character MD5 identity hash for a medicine.
+
+    Medicines with identical normalized name, manufacturer, packaging, and composition
+    are considered identical products to prevent duplicate rows.
+    """
+    key = f"{name_normalized or ''}|{manufacturer_normalized or ''}|{pack_size_label or ''}|{composition_normalized or ''}"
+    return hashlib.md5(key.encode("utf-8")).hexdigest()
+
+
 def parse_price(value: str | None) -> float | None:
     """Safely parse price value."""
     if not value or value.strip() == "":
@@ -179,6 +195,8 @@ def import_csv(
             conn.commit()
 
             batch = []
+            seen_identity_hashes: set[str] = set()
+            duplicate_rows = 0
 
             for row in reader:
                 total_rows += 1
@@ -208,6 +226,18 @@ def import_csv(
                 manufacturer_normalized = normalize_manufacturer(manufacturer) if manufacturer else None
                 composition_normalized = normalize_composition(comp1, comp2)
                 source_hash = compute_row_hash(row)
+                product_identity_hash = compute_product_identity_hash(
+                    name_normalized,
+                    manufacturer_normalized,
+                    pack_size,
+                    composition_normalized,
+                )
+
+                # In-stream deduplication: skip duplicates in CSV to prevent redundant rows
+                if product_identity_hash in seen_identity_hashes:
+                    duplicate_rows += 1
+                    continue
+                seen_identity_hashes.add(product_identity_hash)
 
                 medicine_id = str(uuid.uuid4())
 
@@ -228,6 +258,7 @@ def import_csv(
                     salt,
                     version_id,
                     source_hash,
+                    product_identity_hash,
                 ))
                 accepted_rows += 1
 
@@ -235,13 +266,13 @@ def import_csv(
                 if len(batch) >= batch_size:
                     _insert_batch(conn, batch)
                     batch = []
-                    print(f"  Imported {accepted_rows} rows...", end="\r")
+                    print(f"  Imported {accepted_rows} rows (deduplicated {duplicate_rows})...", end="\r")
 
             # Final batch
             if batch:
                 _insert_batch(conn, batch)
 
-        print(f"\nImport complete: {accepted_rows} accepted, {rejected_rows} rejected out of {total_rows} total")
+        print(f"\nImport complete: {accepted_rows} accepted, {duplicate_rows} duplicate medicines deduplicated, {rejected_rows} rejected out of {total_rows} total")
 
         # Activate catalog version
         with conn.cursor() as cur:
@@ -283,6 +314,7 @@ def import_csv(
             "total_rows": total_rows,
             "accepted_rows": accepted_rows,
             "rejected_rows": rejected_rows,
+            "duplicate_rows": duplicate_rows,
             "file_hash": file_hash,
         }
 
@@ -308,18 +340,65 @@ def import_csv(
 
 
 def _insert_batch(conn: psycopg.Connection, batch: list[tuple]) -> None:
-    """Insert a batch of medicines using COPY for high performance."""
+    """
+    Insert a batch of medicines using COPY into a temporary staging table,
+    then upsert into medicines table ON CONFLICT (product_identity_hash) DO UPDATE.
+    This guarantees zero duplicate rows and allows safe re-imports / updates.
+    """
     with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TEMP TABLE IF NOT EXISTS staging_medicines (
+                id UUID,
+                source_id VARCHAR(64),
+                name VARCHAR(512),
+                name_normalized VARCHAR(512),
+                price NUMERIC(10, 2),
+                is_discontinued BOOLEAN,
+                manufacturer_name VARCHAR(512),
+                manufacturer_normalized VARCHAR(512),
+                type VARCHAR(64),
+                pack_size_label VARCHAR(255),
+                short_composition1 TEXT,
+                short_composition2 TEXT,
+                composition_normalized TEXT,
+                salt_composition TEXT,
+                catalog_version_id UUID,
+                source_hash VARCHAR(64),
+                product_identity_hash VARCHAR(64)
+            ) ON COMMIT DROP;
+            TRUNCATE TABLE staging_medicines;
+        """)
         with cur.copy(
-            """COPY medicines
+            """COPY staging_medicines
                (id, source_id, name, name_normalized, price, is_discontinued,
                 manufacturer_name, manufacturer_normalized, type, pack_size_label,
                 short_composition1, short_composition2, composition_normalized,
-                salt_composition, catalog_version_id, source_hash)
+                salt_composition, catalog_version_id, source_hash, product_identity_hash)
                FROM STDIN"""
         ) as copy:
             for row in batch:
                 copy.write_row(row)
+
+        cur.execute("""
+            INSERT INTO medicines (
+                id, source_id, name, name_normalized, price, is_discontinued,
+                manufacturer_name, manufacturer_normalized, type, pack_size_label,
+                short_composition1, short_composition2, composition_normalized,
+                salt_composition, catalog_version_id, source_hash, product_identity_hash
+            )
+            SELECT
+                id, source_id, name, name_normalized, price, is_discontinued,
+                manufacturer_name, manufacturer_normalized, type, pack_size_label,
+                short_composition1, short_composition2, composition_normalized,
+                salt_composition, catalog_version_id, source_hash, product_identity_hash
+            FROM staging_medicines
+            ON CONFLICT (product_identity_hash) DO UPDATE SET
+                price = EXCLUDED.price,
+                is_discontinued = EXCLUDED.is_discontinued,
+                catalog_version_id = EXCLUDED.catalog_version_id,
+                source_hash = EXCLUDED.source_hash,
+                updated_at = now();
+        """)
     conn.commit()
 
 

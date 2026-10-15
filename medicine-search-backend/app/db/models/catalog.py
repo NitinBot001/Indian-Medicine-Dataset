@@ -108,6 +108,9 @@ class Medicine(Base):
         ForeignKey("catalog_versions.id")
     )
     source_hash: Mapped[str | None] = mapped_column(String(64))
+    product_identity_hash: Mapped[str | None] = mapped_column(
+        String(64), unique=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()")
     )

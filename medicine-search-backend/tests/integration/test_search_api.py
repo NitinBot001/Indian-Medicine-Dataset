@@ -26,8 +26,25 @@ def test_catalog_status(client):
     data = resp.json()
     assert data["status"] == "ok"
     assert data["database"] == "connected"
-    assert data["medicine_count"] == 253973
+    assert data["medicine_count"] == 253937
     assert data["catalog_version"] is not None
+
+
+def test_database_deduplication_integrity():
+    """Verify that zero duplicates exist in the database and unique constraint is active."""
+    import psycopg
+    from app.core.config import get_settings, normalize_db_url_for_sync
+    settings = get_settings()
+    sync_url = normalize_db_url_for_sync(settings.DATABASE_URL)
+    with psycopg.connect(sync_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*), COUNT(DISTINCT product_identity_hash)
+                FROM medicines;
+            """)
+            total_count, distinct_count = cur.fetchone()
+            assert total_count == distinct_count, f"Duplicates detected: {total_count} total != {distinct_count} distinct"
+            assert total_count == 253937
 
 
 def test_exact_search_returns_fast(client):
