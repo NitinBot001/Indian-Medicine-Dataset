@@ -1,0 +1,77 @@
+"""
+Integration tests for search API endpoints (plan.md Section 7 & 11).
+"""
+
+import pytest
+import httpx
+
+BASE_URL = "http://localhost:8000"
+
+
+@pytest.fixture
+def client():
+    with httpx.Client(base_url=BASE_URL, timeout=10.0) as c:
+        yield c
+
+
+def test_health_check(client):
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+
+def test_catalog_status(client):
+    resp = client.get("/api/v1/admin/catalog/status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["database"] == "connected"
+    assert data["medicine_count"] == 253973
+    assert data["catalog_version"] is not None
+
+
+def test_exact_search_returns_fast(client):
+    resp = client.get("/api/v1/search", params={"q": "Augmentin 625 Duo Tablet", "limit": 5})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["latency_ms"] < 100.0
+    assert len(data["catalog_matches"]) >= 1
+    top = data["catalog_matches"][0]
+    assert top["name"] == "Augmentin 625 Duo Tablet"
+    assert top["match_reason"] == "exact_name"
+    assert top["score"] == 1.0
+    assert top["selectable"] is True
+
+
+def test_fuzzy_typo_search(client):
+    # Typo: augmentn 625 instead of Augmentin 625
+    resp = client.get("/api/v1/search", params={"q": "augmentn 625", "limit": 5})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["latency_ms"] < 100.0
+    assert len(data["catalog_matches"]) >= 1
+    top = data["catalog_matches"][0]
+    assert "Augmentin" in top["name"]
+    assert top["match_reason"] == "typo_match"
+
+
+def test_prefix_search(client):
+    resp = client.get("/api/v1/search", params={"q": "dolo 650", "limit": 5})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["latency_ms"] < 100.0
+    assert len(data["catalog_matches"]) >= 1
+    top = data["catalog_matches"][0]
+    assert "Dolo 650" in top["name"]
+
+
+def test_discontinued_not_selectable(client):
+    # Search for an item and verify selectable matches discontinued flag
+    resp = client.get("/api/v1/search", params={"q": "augmentin", "limit": 10})
+    assert resp.status_code == 200
+    data = resp.json()
+    for item in data["catalog_matches"]:
+        if item["is_discontinued"]:
+            assert item["selectable"] is False
+        else:
+            assert item["selectable"] is True
