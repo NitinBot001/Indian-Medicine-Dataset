@@ -219,25 +219,36 @@ SELECT 'Schema setup complete. Tables and indexes created.' AS result;
 
 def setup_database(database_url: str | None = None) -> None:
     """Create all tables and indexes."""
-    db_url = database_url or os.getenv(
-        "DATABASE_URL_SYNC",
-        "postgresql://medicine:medicine_dev@localhost:5432/medicine_search",
-    )
-    # Strip SQLAlchemy driver prefix if present
-    if db_url.startswith("postgresql+"):
-        db_url = "postgresql" + db_url[db_url.index("://"):]
+    from app.core.config import normalize_db_url_for_sync
 
-    print(f"Connecting to: {db_url.split('@')[1] if '@' in db_url else db_url}")
+    raw_url = (
+        database_url
+        or os.getenv("AIVEN_DATABASE_URL")
+        or os.getenv("DATABASE_URL_SYNC")
+        or os.getenv("DATABASE_URL")
+        or "postgresql://medicine:medicine_dev@localhost:5432/medicine_search"
+    )
+    db_url = normalize_db_url_for_sync(raw_url)
+
+    # Print masked host info
+    host_info = db_url.split("@")[1] if "@" in db_url else db_url
+    print(f"Connecting to: {host_info}")
 
     conn = psycopg.connect(db_url)
     try:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
         conn.commit()
-        print("✓ Database schema created successfully")
+        print("✓ Database schema and indexes created successfully")
     finally:
         conn.close()
 
 
 if __name__ == "__main__":
-    setup_database()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Create database tables and indexes")
+    parser.add_argument("--database-url", help="Connection URI (e.g. Aiven Service URI)")
+    args = parser.parse_args()
+
+    setup_database(args.database_url)

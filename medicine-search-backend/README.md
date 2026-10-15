@@ -24,11 +24,33 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 python scripts/benchmark_search.py
 ```
 
-Or use the all-in-one script:
+Or use the all-in-one script for local Docker:
 ```bash
 chmod +x setup_and_run.sh
 ./setup_and_run.sh
 ```
+
+## Aiven for PostgreSQL Setup (Cloud Database)
+
+To connect directly to **Aiven for PostgreSQL** instead of local Docker:
+
+1. Copy your **Service URI** from the [Aiven Console](https://console.aiven.io):
+   `postgres://avnadmin:PASSWORD@pg-your-project.aivencloud.com:PORT/defaultdb?sslmode=require`
+
+2. Run the automated Aiven setup & ingestion script:
+   ```bash
+   python scripts/setup_aiven.py --url "postgres://avnadmin:PASSWORD@pg-your-project.aivencloud.com:PORT/defaultdb?sslmode=require"
+   ```
+   This will:
+   - Connect via SSL
+   - Create `pg_trgm` extension, tables, and search indexes
+   - Bulk-stream all 253,973 medicines via PostgreSQL `COPY`
+   - Test search queries and save `DATABASE_URL` to your `.env`
+
+3. Start the FastAPI server pointing to Aiven:
+   ```bash
+   uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+   ```
 
 ## API Endpoints
 

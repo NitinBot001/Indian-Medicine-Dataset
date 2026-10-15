@@ -89,9 +89,8 @@ def import_csv(
     file_path = str(Path(file_path).resolve())
     file_hash = compute_file_hash(file_path)
 
-    # Strip SQLAlchemy driver prefix if present
-    if database_url.startswith("postgresql+"):
-        database_url = "postgresql" + database_url[database_url.index("://"):]
+    from app.core.config import normalize_db_url_for_sync
+    database_url = normalize_db_url_for_sync(database_url)
 
     # Connect synchronously for bulk import
     conn = psycopg.connect(database_url, row_factory=dict_row)
@@ -338,7 +337,16 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    db_url = args.database_url or os.getenv("DATABASE_URL_SYNC", "postgresql://medicine:medicine_dev@localhost:5432/medicine_search")
+    from app.core.config import normalize_db_url_for_sync
+
+    raw_url = (
+        args.database_url
+        or os.getenv("AIVEN_DATABASE_URL")
+        or os.getenv("DATABASE_URL_SYNC")
+        or os.getenv("DATABASE_URL")
+        or "postgresql://medicine:medicine_dev@localhost:5432/medicine_search"
+    )
+    db_url = normalize_db_url_for_sync(raw_url)
 
     result = import_csv(args.file, db_url, args.batch_size)
     print(f"\nResult: {result}")
