@@ -1,0 +1,25 @@
+# Ignore raw datasets to keep serverless function bundles small (<10MB)
+DATA/
+*.csv
+*.json
+
+# Ignore development and testing artifacts
+tests/
+.pytest_cache/
+__pycache__/
+*.pyc
+.coverage
+htmlcov/
+.git/
+.github/
+.vscode/
+.devcontainer/
+
+# Ignore documentation & local scratch
+*.md
+LICENSE
+scratch/
+
+# Ignore local envs & venvs
+.venv/
+.env

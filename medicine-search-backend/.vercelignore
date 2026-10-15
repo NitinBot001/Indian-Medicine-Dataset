@@ -1,0 +1,14 @@
+# Ignore testing, local artifacts, and docs
+tests/
+.pytest_cache/
+__pycache__/
+*.pyc
+.coverage
+htmlcov/
+*.md
+docker-compose.yml
+init-extensions.sql
+setup_and_run.sh
+scripts/
+.venv/
+.env
