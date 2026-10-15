@@ -46,6 +46,20 @@ app.include_router(search_router, prefix="/api/v1")
 app.include_router(catalog_router, prefix="/api/v1")
 
 
+@app.get("/")
+async def root():
+    """Root info endpoint."""
+    return {
+        "name": "Medicine Fuzzy Search API",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "health": "/health",
+        "search_example": "/api/v1/search?q=augmentin%20625&limit=5",
+        "database": db_manager.active_dialect,
+        "is_fallback": db_manager.is_fallback,
+    }
+
+
 @app.get("/health")
 async def health():
     """Basic health check with active database dialect info."""

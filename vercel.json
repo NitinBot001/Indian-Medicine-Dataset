@@ -20,6 +20,30 @@
   },
   "rewrites": [
     {
+      "source": "/api/(.*)",
+      "destination": {
+        "service": "medicine-search-backend"
+      }
+    },
+    {
+      "source": "/health",
+      "destination": {
+        "service": "medicine-search-backend"
+      }
+    },
+    {
+      "source": "/docs",
+      "destination": {
+        "service": "medicine-search-backend"
+      }
+    },
+    {
+      "source": "/openapi.json",
+      "destination": {
+        "service": "medicine-search-backend"
+      }
+    },
+    {
       "source": "/(.*)",
       "destination": {
         "service": "app"
