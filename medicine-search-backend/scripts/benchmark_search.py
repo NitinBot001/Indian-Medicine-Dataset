@@ -161,8 +161,9 @@ def run_benchmark(base_url: str, iterations: int = 3) -> dict:
 
 
 if __name__ == "__main__":
+    default_base_url = os.getenv("MEDICINE_SEARCH_BACKEND_URL", "http://localhost:8000")
     parser = argparse.ArgumentParser(description="Benchmark medicine search")
-    parser.add_argument("--url", default="http://localhost:8000", help="Base API URL")
+    parser.add_argument("--url", default=default_base_url, help="Base API URL")
     parser.add_argument("--iterations", type=int, default=3, help="Iterations per query")
     args = parser.parse_args()
 

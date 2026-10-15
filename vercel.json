@@ -1,15 +1,29 @@
 {
-  "version": 2,
-  "builds": [
-    {
-      "src": "api/index.py",
-      "use": "@vercel/python"
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "app": {
+      "root": ".",
+      "framework": "fastapi",
+      "bindings": [
+        {
+          "type": "service",
+          "service": "medicine-search-backend",
+          "format": "url",
+          "env": "MEDICINE_SEARCH_BACKEND_URL"
+        }
+      ]
+    },
+    "medicine-search-backend": {
+      "root": "medicine-search-backend",
+      "framework": "fastapi"
     }
-  ],
-  "routes": [
+  },
+  "rewrites": [
     {
-      "src": "/(.*)",
-      "dest": "api/index.py"
+      "source": "/(.*)",
+      "destination": {
+        "service": "app"
+      }
     }
   ]
 }

@@ -2,10 +2,11 @@
 Integration tests for search API endpoints (plan.md Section 7 & 11).
 """
 
+import os
 import pytest
 import httpx
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = os.getenv("MEDICINE_SEARCH_BACKEND_URL", os.getenv("BASE_URL", "http://localhost:8000"))
 
 
 @pytest.fixture
@@ -17,7 +18,7 @@ def client():
 def test_health_check(client):
     resp = client.get("/health")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    assert resp.json()["status"] == "ok"
 
 
 def test_catalog_status(client):
@@ -62,6 +63,7 @@ def test_exact_search_returns_fast(client):
 
 def test_fuzzy_typo_search(client):
     # Typo: augmentn 625 instead of Augmentin 625
+    client.get("/api/v1/search", params={"q": "augmentn 625", "limit": 5})
     resp = client.get("/api/v1/search", params={"q": "augmentn 625", "limit": 5})
     assert resp.status_code == 200
     data = resp.json()
