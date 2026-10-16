@@ -1,18 +1,25 @@
 """
 Integration tests for search API endpoints (plan.md Section 7 & 11).
+Uses starlette.testclient.TestClient (backed by ASGI transport) for in-process testing.
 """
 
 import os
 import pytest
 import httpx
+from starlette.testclient import TestClient
 
-BASE_URL = os.getenv("MEDICINE_SEARCH_BACKEND_URL", os.getenv("BASE_URL", "http://localhost:8000"))
+from app.main import app
 
 
 @pytest.fixture
 def client():
-    with httpx.Client(base_url=BASE_URL, timeout=10.0) as c:
-        yield c
+    backend_url = os.getenv("MEDICINE_SEARCH_BACKEND_URL")
+    if backend_url:
+        with httpx.Client(base_url=backend_url, timeout=15.0) as c:
+            yield c
+    else:
+        with TestClient(app) as c:
+            yield c
 
 
 def test_health_check(client):
@@ -108,7 +115,7 @@ def test_three_parameter_priority(client):
     # First match must be a name match
     assert matches[0]["match_parameter"] == "name"
     assert "panto" in matches[0]["name"].lower()
-    
+
     # Check that any name match has a higher score than any composition match
     name_scores = [m["score"] for m in matches if m["match_parameter"] == "name"]
     comp_scores = [m["score"] for m in matches if m["match_parameter"] == "composition"]

@@ -27,6 +27,12 @@ class MedicineMatch(BaseModel):
         default=True,
         description="Whether this item can be selected in billing (False if discontinued or not verified)"
     )
+    match_tier: int = Field(default=1, description="Ranking ladder tier (T0-T7)")
+    matched_on: str = Field(default="name", description="Field matched: name, composition, manufacturer")
+    corrected_query: str | None = Field(default=None, description="Suggested correction token if typo or abbreviation")
+    low_confidence: bool = Field(default=False, description="Flagged true if last resort match")
+    in_stock: bool | None = Field(default=None, description="Whether available in shop inventory")
+    stock_quantity: int | None = Field(default=None, description="Current stock quantity in shop")
 
 
 class SearchResponse(BaseModel):
@@ -42,6 +48,52 @@ class SearchResponse(BaseModel):
         default_factory=list,
         description="Matches from national catalog (shown second)"
     )
+    corrected_query: str | None = Field(
+        default=None,
+        description="Suggested spelling or salt correction for the overall query"
+    )
+    debug_info: dict | None = Field(
+        default=None,
+        description="Search execution profile and diagnostics (returned when debug=true)"
+    )
+
+
+class SearchFeedbackRequest(BaseModel):
+    """Event payload when a pharmacist selects a medicine for billing (Phase 4)."""
+    query: str = Field(..., min_length=1, max_length=200, description="Search query string that was typed")
+    medicine_id: str = Field(..., description="ID of the medicine selected")
+    shop_id: str | None = Field(default=None, description="Optional shop identifier where billing occurred")
+    rank_selected: int = Field(default=1, ge=1, le=100, description="1-based rank position of the item when clicked")
+
+
+class SearchFeedbackResponse(BaseModel):
+    """Response after recording user selection feedback."""
+    status: str = "recorded"
+    medicine_id: str
+    query: str
+    selection_count: int
+    learned_alias: bool = False
+
+
+class ShopInventoryItem(BaseModel):
+    """Single item update for shop inventory."""
+    medicine_id: str = Field(..., description="Medicine ID in catalog")
+    quantity: int = Field(default=0, ge=0, description="Available stock quantity")
+    is_in_stock: bool = Field(default=True, description="Whether currently in stock")
+    custom_price: float | None = Field(default=None, ge=0.0, description="Optional shop-specific retail price")
+
+
+class ShopInventoryBatchRequest(BaseModel):
+    """Batch stock update request for a pharmacy shop."""
+    shop_id: str = Field(..., min_length=1, max_length=128, description="Unique shop identifier")
+    items: list[ShopInventoryItem] = Field(..., min_length=1, description="List of items to update")
+
+
+class ShopInventoryResponse(BaseModel):
+    """Response for inventory update."""
+    status: str = "ok"
+    shop_id: str
+    updated_count: int
 
 
 class ImportRequest(BaseModel):
@@ -69,3 +121,5 @@ class HealthResponse(BaseModel):
     is_fallback: bool = False
     catalog_version: str | None = None
     medicine_count: int = 0
+    row_count: int | None = None
+    error: str | None = None

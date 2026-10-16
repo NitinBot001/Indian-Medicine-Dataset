@@ -1,52 +1,49 @@
 """
-Fuzzy search service for medicines using PostgreSQL pg_trgm and SQLite fallback.
+Medicine search service with single round-trip PL/pgSQL engine, SQLite fallback,
+and Phase 4 feedback loop & shop inventory support.
 
-Strict 3-Parameter Search Hierarchy (User Requirement):
-1. PARAMETER 1: Medicine Name (नाम) — Highest Priority (Top of List)
-   Results within this group are sorted by name-similarity to the query (closest name first):
-   - Exact Name Match  → score 1.00
-   - Prefix Name Match → scored by closeness of name to query
-   - Exact/Prefix Approved Alias → score 0.90
-   - Word/Token Name Match → scored by closeness
-   - Typo / Trigram Fuzzy Name Match → scored by similarity
-   * If Name matches fulfill limit, return immediately (zero composition/company pollution).
-
-2. PARAMETER 2: Composition (कंपोजिशन) — Second Priority (Middle of List)
-   * Only executed if Name matches < limit.
-   Results within this group are also sorted by name-similarity to query:
-   - Prefix / Word Match on active salts/composition
-   - Substring / Fuzzy Match on active salts/composition
-
-3. PARAMETER 3: Company / Manufacturer (कंपनी) — Third Priority (Bottom of List)
-   * Only executed if Name + Composition matches < limit.
-   Results within this group are sorted by name-similarity to query:
-   - Prefix / Word Match on company name
-   - Substring / Fuzzy Match on company name
-
-Final output = Name_bucket + Composition_bucket + Manufacturer_bucket
-(strictly NO cross-bucket mixing — each bucket sorted by name-similarity internally)
+Features:
+- Single-statement PL/pgSQL function execution in PostgreSQL (Phase 3).
+- Strict Intent Ladder (T0-T7):
+    T0: Exact name match
+    T1: Prefix name match (name starts with query)
+    T2: Typo tolerance (Levenshtein <= 2) and abbreviation on brand lexicon
+    T3: Word-start prefix AND on name tsvector
+    T4: Cross-field AND (name + manufacturer or name + composition)
+    T5: Composition (active salt) match with typo tolerance against ingredient lexicon
+    T6: Manufacturer match
+    T7: Last resort trigram match (low_confidence=True, similarity >= 0.45)
+- Phase 4: Usage popularity boost (selection_count DESC inside tiers).
+- Phase 4: Shop inventory lookup & stock decoration.
+- Phase 4: Feedback recording & auto-learning query aliases.
+- In-memory TTLCache with cachetools (maxsize=10000, ttl=60s).
+- Resilient SQLite fallback engine for offline/test environments.
 """
 
 import difflib
-import re
-import time
+import logging
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 
+import cachetools
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services.normalization import normalize_medicine_name
+from app.services.normalization import normalize_query
+
+logger = logging.getLogger("medicine_search")
 
 
 class MatchReason(str, Enum):
     EXACT_NAME = "exact_name"
-    EXACT_ALIAS = "exact_alias"
     PREFIX = "prefix"
     TOKEN_MATCH = "token_match"
+    CROSS_FIELD = "cross_field"
     TYPO_MATCH = "typo_match"
     COMPOSITION_MATCH = "composition_match"
     MANUFACTURER_MATCH = "manufacturer_match"
+    TRIGRAM_FALLBACK = "trigram_fallback"
 
 
 @dataclass
@@ -59,283 +56,120 @@ class SearchResult:
     pack_size_label: str | None
     price: float | None
     is_discontinued: bool
-    match_parameter: str  # "name", "composition", or "manufacturer"
-    match_reason: str     # "exact_name", "prefix", "token_match", "typo_match", etc.
-    score: float
+    match_parameter: str = "name"
+    match_reason: str = "prefix"
+    score: float = 0.0
+    match_tier: int = 1
+    matched_on: str = "name"
+    corrected_query: str | None = None
+    low_confidence: bool = False
+    in_stock: bool | None = None
+    stock_quantity: int | None = None
+    custom_price: float | None = None
 
 
-# In-memory LRU query cache (5 min TTL) for ultra-fast autocomplete
-_CACHE: dict[str, tuple[float, list[SearchResult]]] = {}
-_CACHE_TTL_SECONDS = 300
-_MAX_CACHE_SIZE = 1000
+# In-memory LRU cache per specification (TTL = 60s, maxsize = 10,000)
+SEARCH_CACHE = cachetools.TTLCache(maxsize=10000, ttl=60)
 
-
-# ============================================================
-# PARAMETER 1: MEDICINE NAME POSTGRESQL QUERIES (Score 0.75 - 1.00)
-# ============================================================
-
-# 1A. Exact Name Match (B-Tree: <0.5ms)
-PG_EXACT_NAME_QUERY = text("""
-SELECT
-    m.id::text AS medicine_id,
-    m.source_id,
-    m.name,
-    m.manufacturer_name,
-    COALESCE(m.short_composition1, '') ||
-        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
-            THEN ' + ' || m.short_composition2
-            ELSE ''
-        END AS composition,
-    m.pack_size_label,
-    m.price::float,
-    m.is_discontinued,
-    'name' AS match_parameter,
-    'exact_name' AS match_reason,
-    1.0::float AS score
-FROM medicines m
-WHERE m.name_normalized = :q
-LIMIT :limit
-""")
-
-# 1B. Prefix Name Match (name starts with query)
-PG_PREFIX_NAME_QUERY = text("""
-SELECT
-    m.id::text AS medicine_id,
-    m.source_id,
-    m.name,
-    m.manufacturer_name,
-    COALESCE(m.short_composition1, '') ||
-        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
-            THEN ' + ' || m.short_composition2
-            ELSE ''
-        END AS composition,
-    m.pack_size_label,
-    m.price::float,
-    m.is_discontinued,
-    'name' AS match_parameter,
-    'prefix' AS match_reason,
-    (0.91 + 0.06 * (length(:q)::float / GREATEST(length(m.name_normalized), 1)))::float AS score
-FROM medicines m
-WHERE m.name_normalized LIKE (:q || '%')
-  AND (CAST(:existing_ids AS text[]) IS NULL OR NOT (m.id::text = ANY(CAST(:existing_ids AS text[]))))
-ORDER BY length(m.name_normalized), m.name_normalized
-LIMIT :remaining
-""")
-
-# 1C. Exact & Prefix Alias Matches
-PG_ALIAS_QUERY = text("""
-SELECT
-    m.id::text AS medicine_id,
-    m.source_id,
-    m.name,
-    m.manufacturer_name,
-    COALESCE(m.short_composition1, '') ||
-        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
-            THEN ' + ' || m.short_composition2
-            ELSE ''
-        END AS composition,
-    m.pack_size_label,
-    m.price::float,
-    m.is_discontinued,
-    'name' AS match_parameter,
-    'exact_alias' AS match_reason,
-    0.90::float AS score
-FROM medicine_aliases ma
-JOIN medicines m ON m.id = ma.medicine_id
-WHERE (ma.alias_normalized = :q OR ma.alias_normalized LIKE (:q || '%'))
-  AND (CAST(:existing_ids AS text[]) IS NULL OR NOT (m.id::text = ANY(CAST(:existing_ids AS text[]))))
-LIMIT :remaining
-""")
-
-# 1D. Token / Word Match in Medicine Name
-PG_TOKEN_NAME_QUERY = text("""
-SELECT
-    m.id::text AS medicine_id,
-    m.source_id,
-    m.name,
-    m.manufacturer_name,
-    COALESCE(m.short_composition1, '') ||
-        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
-            THEN ' + ' || m.short_composition2
-            ELSE ''
-        END AS composition,
-    m.pack_size_label,
-    m.price::float,
-    m.is_discontinued,
-    'name' AS match_parameter,
-    'token_match' AS match_reason,
-    (0.85 + 0.04 * (length(:q)::float / GREATEST(length(m.name_normalized), 1)))::float AS score
-FROM medicines m
-WHERE (m.name_normalized LIKE ('% ' || :q || '%') OR m.name_normalized LIKE ('%' || :q || '%'))
-  AND (CAST(:existing_ids AS text[]) IS NULL OR NOT (m.id::text = ANY(CAST(:existing_ids AS text[]))))
-ORDER BY length(m.name_normalized), m.name_normalized
-LIMIT :remaining
-""")
-
-# 1E. Decomposed Fuzzy for Brand Typo + Number (e.g. "pantoseb 40" -> "pantosec 40")
-PG_FUZZY_DECOMPOSED_QUERY = text("""
-SELECT
-    m.id::text AS medicine_id,
-    m.source_id,
-    m.name,
-    m.manufacturer_name,
-    COALESCE(m.short_composition1, '') ||
-        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
-            THEN ' + ' || m.short_composition2
-            ELSE ''
-        END AS composition,
-    m.pack_size_label,
-    m.price::float,
-    m.is_discontinued,
-    'name' AS match_parameter,
-    'typo_match' AS match_reason,
-    (0.75 + 0.09 * similarity(m.name_normalized, :q))::float AS score
-FROM medicines m
-WHERE m.name_normalized % :brand_q
-  AND m.name_normalized LIKE ('%' || :num_q || '%')
-  AND (CAST(:existing_ids AS text[]) IS NULL OR NOT (m.id::text = ANY(CAST(:existing_ids AS text[]))))
-ORDER BY similarity(m.name_normalized, :q) DESC
-LIMIT :remaining
-""")
-
-# 1F. Standard Trigram Fuzzy Name Typo Match (e.g. "pantoseb" -> "pantosec")
-PG_FUZZY_NAME_QUERY = text("""
-SELECT
-    m.id::text AS medicine_id,
-    m.source_id,
-    m.name,
-    m.manufacturer_name,
-    COALESCE(m.short_composition1, '') ||
-        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
-            THEN ' + ' || m.short_composition2
-            ELSE ''
-        END AS composition,
-    m.pack_size_label,
-    m.price::float,
-    m.is_discontinued,
-    'name' AS match_parameter,
-    'typo_match' AS match_reason,
-    (0.75 + 0.09 * similarity(m.name_normalized, :q))::float AS score
-FROM medicines m
-WHERE m.name_normalized % :q
-  AND (CAST(:existing_ids AS text[]) IS NULL OR NOT (m.id::text = ANY(CAST(:existing_ids AS text[]))))
-ORDER BY similarity(m.name_normalized, :q) DESC
-LIMIT :remaining
-""")
+# Common ingredient typos for fallback matching
+KNOWN_INGREDIENT_TYPOS = {
+    "pantaprazole": "pantoprazole",
+    "paracetmol": "paracetamol",
+    "amoxycllin": "amoxycillin",
+    "cetrizine": "cetirizine",
+    "azithromycin": "azithromycin",
+    "ciprofloxacin": "ciprofloxacin",
+}
 
 
 # ============================================================
-# PARAMETER 2: COMPOSITION POSTGRESQL QUERIES (Score 0.55 - 0.70)
+# POSTGRESQL SINGLE ROUND-TRIP SEARCH FUNCTION
 # ============================================================
 
-# 2A. Prefix / Word Match on Composition (Active Ingredients / Salts)
-PG_PREFIX_COMPOSITION_QUERY = text("""
+PG_SEARCH_FUNCTION_QUERY = text("""
 SELECT
-    m.id::text AS medicine_id,
-    m.source_id,
-    m.name,
-    m.manufacturer_name,
-    COALESCE(m.short_composition1, '') ||
-        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
-            THEN ' + ' || m.short_composition2
-            ELSE ''
-        END AS composition,
-    m.pack_size_label,
-    m.price::float,
-    m.is_discontinued,
-    'composition' AS match_parameter,
-    'composition_match' AS match_reason,
-    (0.65 + 0.05 * (length(:q)::float / GREATEST(length(COALESCE(m.composition_normalized, '')), 1)))::float AS score
-FROM medicines m
-WHERE (m.composition_normalized LIKE (:q || '%') OR m.composition_normalized LIKE ('% ' || :q || '%'))
-  AND (CAST(:existing_ids AS text[]) IS NULL OR NOT (m.id::text = ANY(CAST(:existing_ids AS text[]))))
-ORDER BY length(m.name_normalized), m.name_normalized
-LIMIT :remaining
-""")
-
-# 2B. Substring / Fuzzy Trigram Match on Composition
-PG_FUZZY_COMPOSITION_QUERY = text("""
-SELECT
-    m.id::text AS medicine_id,
-    m.source_id,
-    m.name,
-    m.manufacturer_name,
-    COALESCE(m.short_composition1, '') ||
-        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
-            THEN ' + ' || m.short_composition2
-            ELSE ''
-        END AS composition,
-    m.pack_size_label,
-    m.price::float,
-    m.is_discontinued,
-    'composition' AS match_parameter,
-    'composition_match' AS match_reason,
-    (0.55 + 0.09 * similarity(COALESCE(m.composition_normalized, ''), :q))::float AS score
-FROM medicines m
-WHERE (m.composition_normalized % :q OR m.composition_normalized LIKE ('%' || :q || '%'))
-  AND (CAST(:existing_ids AS text[]) IS NULL OR NOT (m.id::text = ANY(CAST(:existing_ids AS text[]))))
-ORDER BY similarity(COALESCE(m.composition_normalized, ''), :q) DESC, length(m.name_normalized)
-LIMIT :remaining
+    medicine_id,
+    source_id,
+    name,
+    manufacturer_name,
+    composition,
+    pack_size_label,
+    price,
+    is_discontinued,
+    match_tier,
+    matched_on,
+    match_reason,
+    score,
+    corrected_query,
+    low_confidence
+FROM search_medicines(
+    p_tokens => :tokens,
+    p_lim => :lim,
+    p_fields => :fields,
+    p_active_only => :active_only,
+    p_min_price => :min_price,
+    p_max_price => :max_price,
+    p_mfr => :mfr,
+    p_form => :form
+);
 """)
 
 
-# ============================================================
-# PARAMETER 3: COMPANY / MANUFACTURER POSTGRESQL QUERIES (Score 0.35 - 0.50)
-# ============================================================
+async def search_medicines_postgres(
+    session: AsyncSession,
+    tokens: list[str],
+    limit: int = 10,
+    fields: list[str] | None = None,
+    active_only: bool = False,
+    min_price: float | None = None,
+    max_price: float | None = None,
+    manufacturer: str | None = None,
+    form: str | None = None,
+) -> list[SearchResult]:
+    """Execute single round-trip PL/pgSQL search function in PostgreSQL."""
+    if fields is None:
+        fields = ["name", "composition", "manufacturer"]
 
-# 3A. Prefix / Word Match on Company Name
-PG_PREFIX_MANUFACTURER_QUERY = text("""
-SELECT
-    m.id::text AS medicine_id,
-    m.source_id,
-    m.name,
-    m.manufacturer_name,
-    COALESCE(m.short_composition1, '') ||
-        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
-            THEN ' + ' || m.short_composition2
-            ELSE ''
-        END AS composition,
-    m.pack_size_label,
-    m.price::float,
-    m.is_discontinued,
-    'manufacturer' AS match_parameter,
-    'manufacturer_match' AS match_reason,
-    (0.45 + 0.05 * (length(:q)::float / GREATEST(length(COALESCE(m.manufacturer_normalized, '')), 1)))::float AS score
-FROM medicines m
-WHERE (m.manufacturer_normalized LIKE (:q || '%') OR m.manufacturer_normalized LIKE ('% ' || :q || '%'))
-  AND (CAST(:existing_ids AS text[]) IS NULL OR NOT (m.id::text = ANY(CAST(:existing_ids AS text[]))))
-ORDER BY length(m.name_normalized), m.name_normalized
-LIMIT :remaining
-""")
+    res = await session.execute(
+        PG_SEARCH_FUNCTION_QUERY,
+        {
+            "tokens": tokens,
+            "lim": limit,
+            "fields": fields,
+            "active_only": active_only,
+            "min_price": min_price,
+            "max_price": max_price,
+            "mfr": manufacturer,
+            "form": form,
+        },
+    )
 
-# 3B. Substring / Fuzzy Trigram Match on Company Name
-PG_FUZZY_MANUFACTURER_QUERY = text("""
-SELECT
-    m.id::text AS medicine_id,
-    m.source_id,
-    m.name,
-    m.manufacturer_name,
-    COALESCE(m.short_composition1, '') ||
-        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
-            THEN ' + ' || m.short_composition2
-            ELSE ''
-        END AS composition,
-    m.pack_size_label,
-    m.price::float,
-    m.is_discontinued,
-    'manufacturer' AS match_parameter,
-    'manufacturer_match' AS match_reason,
-    (0.35 + 0.09 * similarity(COALESCE(m.manufacturer_normalized, ''), :q))::float AS score
-FROM medicines m
-WHERE (m.manufacturer_normalized % :q OR m.manufacturer_normalized LIKE ('%' || :q || '%'))
-  AND (CAST(:existing_ids AS text[]) IS NULL OR NOT (m.id::text = ANY(CAST(:existing_ids AS text[]))))
-ORDER BY similarity(COALESCE(m.manufacturer_normalized, ''), :q) DESC
-LIMIT :remaining
-""")
+    results: list[SearchResult] = []
+    for row in res.fetchall():
+        results.append(
+            SearchResult(
+                medicine_id=str(row.medicine_id),
+                source_id=row.source_id,
+                name=row.name,
+                manufacturer_name=row.manufacturer_name,
+                composition=row.composition if row.composition else None,
+                pack_size_label=row.pack_size_label,
+                price=float(row.price) if row.price is not None else None,
+                is_discontinued=bool(row.is_discontinued),
+                match_parameter=row.matched_on,
+                match_reason=row.match_reason,
+                score=round(float(row.score), 4),
+                match_tier=int(row.match_tier),
+                matched_on=row.matched_on,
+                corrected_query=row.corrected_query if row.corrected_query else None,
+                low_confidence=bool(row.low_confidence),
+            )
+        )
+    return results
 
 
 # ============================================================
-# SQLITE FALLBACK QUERIES (3 STRICT PARAMETERS)
+# SQLITE FALLBACK LADDER
 # ============================================================
 
 SQLITE_EXACT_NAME_QUERY = text("""
@@ -352,11 +186,18 @@ SELECT
     m.pack_size_label,
     CAST(m.price AS REAL) AS price,
     m.is_discontinued,
-    'name' AS match_parameter,
+    0 AS match_tier,
+    'name' AS matched_on,
     'exact_name' AS match_reason,
     1.0 AS score
 FROM medicines m
-WHERE m.name_normalized = :q
+WHERE (m.name_normalized = :q OR m.name = :q_orig)
+  AND (NOT :active_only OR NOT m.is_discontinued)
+  AND (:min_price IS NULL OR m.price >= :min_price)
+  AND (:max_price IS NULL OR m.price <= :max_price)
+  AND (:mfr IS NULL OR m.manufacturer_normalized LIKE ('%' || :mfr || '%') OR m.manufacturer_name LIKE ('%' || :mfr || '%'))
+  AND (:form IS NULL OR m.name_normalized LIKE ('%' || :form || '%') OR m.pack_size_label LIKE ('%' || :form || '%'))
+ORDER BY m.is_discontinued ASC, COALESCE(m.selection_count, 0) DESC, length(m.name_normalized), m.name_normalized
 LIMIT :limit
 """)
 
@@ -374,16 +215,22 @@ SELECT
     m.pack_size_label,
     CAST(m.price AS REAL) AS price,
     m.is_discontinued,
-    'name' AS match_parameter,
+    1 AS match_tier,
+    'name' AS matched_on,
     'prefix' AS match_reason,
     (0.91 + 0.06 * (CAST(length(:q) AS REAL) / CASE WHEN length(m.name_normalized) > 1 THEN length(m.name_normalized) ELSE 1 END)) AS score
 FROM medicines m
 WHERE m.name_normalized LIKE (:q || '%')
-ORDER BY length(m.name_normalized), m.name_normalized
+  AND (NOT :active_only OR NOT m.is_discontinued)
+  AND (:min_price IS NULL OR m.price >= :min_price)
+  AND (:max_price IS NULL OR m.price <= :max_price)
+  AND (:mfr IS NULL OR m.manufacturer_normalized LIKE ('%' || :mfr || '%') OR m.manufacturer_name LIKE ('%' || :mfr || '%'))
+  AND (:form IS NULL OR m.name_normalized LIKE ('%' || :form || '%') OR m.pack_size_label LIKE ('%' || :form || '%'))
+ORDER BY m.is_discontinued ASC, COALESCE(m.selection_count, 0) DESC, length(m.name_normalized), m.name_normalized
 LIMIT :remaining
 """)
 
-SQLITE_ALIAS_QUERY = text("""
+SQLITE_CROSS_NAME_MFR_QUERY = text("""
 SELECT
     CAST(m.id AS TEXT) AS medicine_id,
     m.source_id,
@@ -397,16 +244,23 @@ SELECT
     m.pack_size_label,
     CAST(m.price AS REAL) AS price,
     m.is_discontinued,
-    'name' AS match_parameter,
-    'exact_alias' AS match_reason,
-    0.90 AS score
-FROM medicine_aliases ma
-JOIN medicines m ON m.id = ma.medicine_id
-WHERE ma.alias_normalized = :q OR ma.alias_normalized LIKE (:q || '%')
+    4 AS match_tier,
+    'name' AS matched_on,
+    'cross_field' AS match_reason,
+    0.72 AS score
+FROM medicines m
+WHERE (m.name_normalized LIKE (:name_token || '%') OR m.name_normalized LIKE ('% ' || :name_token || '%'))
+  AND (m.manufacturer_normalized LIKE (:mfr_token || '%') OR m.manufacturer_normalized LIKE ('% ' || :mfr_token || '%'))
+  AND (NOT :active_only OR NOT m.is_discontinued)
+  AND (:min_price IS NULL OR m.price >= :min_price)
+  AND (:max_price IS NULL OR m.price <= :max_price)
+  AND (:mfr IS NULL OR m.manufacturer_normalized LIKE ('%' || :mfr || '%') OR m.manufacturer_name LIKE ('%' || :mfr || '%'))
+  AND (:form IS NULL OR m.name_normalized LIKE ('%' || :form || '%') OR m.pack_size_label LIKE ('%' || :form || '%'))
+ORDER BY m.is_discontinued ASC, COALESCE(m.selection_count, 0) DESC, length(m.name_normalized)
 LIMIT :remaining
 """)
 
-SQLITE_TOKEN_NAME_QUERY = text("""
+SQLITE_CROSS_NAME_COMP_QUERY = text("""
 SELECT
     CAST(m.id AS TEXT) AS medicine_id,
     m.source_id,
@@ -420,58 +274,48 @@ SELECT
     m.pack_size_label,
     CAST(m.price AS REAL) AS price,
     m.is_discontinued,
-    'name' AS match_parameter,
+    4 AS match_tier,
+    'name' AS matched_on,
+    'cross_field' AS match_reason,
+    0.72 AS score
+FROM medicines m
+WHERE (m.name_normalized LIKE (:name_token || '%') OR m.name_normalized LIKE ('% ' || :name_token || '%'))
+  AND (m.composition_normalized LIKE (:comp_token || '%') OR m.composition_normalized LIKE ('% ' || :comp_token || '%'))
+  AND (NOT :active_only OR NOT m.is_discontinued)
+  AND (:min_price IS NULL OR m.price >= :min_price)
+  AND (:max_price IS NULL OR m.price <= :max_price)
+  AND (:mfr IS NULL OR m.manufacturer_normalized LIKE ('%' || :mfr || '%') OR m.manufacturer_name LIKE ('%' || :mfr || '%'))
+  AND (:form IS NULL OR m.name_normalized LIKE ('%' || :form || '%') OR m.pack_size_label LIKE ('%' || :form || '%'))
+ORDER BY m.is_discontinued ASC, COALESCE(m.selection_count, 0) DESC, length(m.name_normalized)
+LIMIT :remaining
+""")
+
+SQLITE_WORD_TOKEN_QUERY = text("""
+SELECT
+    CAST(m.id AS TEXT) AS medicine_id,
+    m.source_id,
+    m.name,
+    m.manufacturer_name,
+    COALESCE(m.short_composition1, '') ||
+        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
+            THEN ' + ' || m.short_composition2
+            ELSE ''
+        END AS composition,
+    m.pack_size_label,
+    CAST(m.price AS REAL) AS price,
+    m.is_discontinued,
+    3 AS match_tier,
+    'name' AS matched_on,
     'token_match' AS match_reason,
     (0.85 + 0.04 * (CAST(length(:q) AS REAL) / CASE WHEN length(m.name_normalized) > 1 THEN length(m.name_normalized) ELSE 1 END)) AS score
 FROM medicines m
-WHERE m.name_normalized LIKE ('% ' || :q || '%') OR m.name_normalized LIKE ('%' || :q || '%')
-ORDER BY length(m.name_normalized), m.name_normalized
-LIMIT :remaining
-""")
-
-SQLITE_PREFIX_COMPOSITION_QUERY = text("""
-SELECT
-    CAST(m.id AS TEXT) AS medicine_id,
-    m.source_id,
-    m.name,
-    m.manufacturer_name,
-    COALESCE(m.short_composition1, '') ||
-        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
-            THEN ' + ' || m.short_composition2
-            ELSE ''
-        END AS composition,
-    m.pack_size_label,
-    CAST(m.price AS REAL) AS price,
-    m.is_discontinued,
-    'composition' AS match_parameter,
-    'composition_match' AS match_reason,
-    (0.65 + 0.05 * (CAST(length(:q) AS REAL) / CASE WHEN length(COALESCE(m.composition_normalized, '')) > 1 THEN length(m.composition_normalized) ELSE 1 END)) AS score
-FROM medicines m
-WHERE m.composition_normalized LIKE (:q || '%') OR m.composition_normalized LIKE ('% ' || :q || '%')
-ORDER BY length(m.name_normalized), m.name_normalized
-LIMIT :remaining
-""")
-
-SQLITE_PREFIX_MANUFACTURER_QUERY = text("""
-SELECT
-    CAST(m.id AS TEXT) AS medicine_id,
-    m.source_id,
-    m.name,
-    m.manufacturer_name,
-    COALESCE(m.short_composition1, '') ||
-        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
-            THEN ' + ' || m.short_composition2
-            ELSE ''
-        END AS composition,
-    m.pack_size_label,
-    CAST(m.price AS REAL) AS price,
-    m.is_discontinued,
-    'manufacturer' AS match_parameter,
-    'manufacturer_match' AS match_reason,
-    (0.45 + 0.05 * (CAST(length(:q) AS REAL) / CASE WHEN length(COALESCE(m.manufacturer_normalized, '')) > 1 THEN length(m.manufacturer_normalized) ELSE 1 END)) AS score
-FROM medicines m
-WHERE m.manufacturer_normalized LIKE (:q || '%') OR m.manufacturer_normalized LIKE ('% ' || :q || '%')
-ORDER BY length(m.name_normalized), m.name_normalized
+WHERE (m.name_normalized LIKE (:q || '%') OR m.name_normalized LIKE ('% ' || :q || '%'))
+  AND (NOT :active_only OR NOT m.is_discontinued)
+  AND (:min_price IS NULL OR m.price >= :min_price)
+  AND (:max_price IS NULL OR m.price <= :max_price)
+  AND (:mfr IS NULL OR m.manufacturer_normalized LIKE ('%' || :mfr || '%') OR m.manufacturer_name LIKE ('%' || :mfr || '%'))
+  AND (:form IS NULL OR m.name_normalized LIKE ('%' || :form || '%') OR m.pack_size_label LIKE ('%' || :form || '%'))
+ORDER BY m.is_discontinued ASC, COALESCE(m.selection_count, 0) DESC, length(m.name_normalized), m.name_normalized
 LIMIT :remaining
 """)
 
@@ -489,402 +333,473 @@ SELECT
         END AS composition,
     m.pack_size_label,
     CAST(m.price AS REAL) AS price,
-    m.is_discontinued
+    m.is_discontinued,
+    COALESCE(m.selection_count, 0) AS selection_count
 FROM medicines m
-WHERE (m.name_normalized LIKE (:first_char || '%'))
-   OR (:num != '' AND m.name_normalized LIKE ('%' || :num || '%'))
-   OR (:word != '' AND m.name_normalized LIKE ('%' || :word || '%'))
-LIMIT 300
+WHERE ((:first_char != '' AND m.name_normalized LIKE (:first_char || '%'))
+       OR (:word != '' AND (m.name_normalized LIKE (:word || '%') OR m.name_normalized LIKE ('% ' || :word || '%')))
+       OR (:num != '' AND m.name_normalized LIKE ('%' || :num || '%')))
+  AND (NOT :active_only OR NOT m.is_discontinued)
+  AND (:min_price IS NULL OR m.price >= :min_price)
+  AND (:max_price IS NULL OR m.price <= :max_price)
+  AND (:mfr IS NULL OR m.manufacturer_normalized LIKE ('%' || :mfr || '%') OR m.manufacturer_name LIKE ('%' || :mfr || '%'))
+  AND (:form IS NULL OR m.name_normalized LIKE ('%' || :form || '%') OR m.pack_size_label LIKE ('%' || :form || '%'))
+ORDER BY m.is_discontinued ASC, COALESCE(m.selection_count, 0) DESC, length(m.name_normalized)
+LIMIT 150
+""")
+
+SQLITE_PREFIX_COMPOSITION_QUERY = text("""
+SELECT
+    CAST(m.id AS TEXT) AS medicine_id,
+    m.source_id,
+    m.name,
+    m.manufacturer_name,
+    COALESCE(m.short_composition1, '') ||
+        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
+            THEN ' + ' || m.short_composition2
+            ELSE ''
+        END AS composition,
+    m.pack_size_label,
+    CAST(m.price AS REAL) AS price,
+    m.is_discontinued,
+    5 AS match_tier,
+    'composition' AS matched_on,
+    'composition_match' AS match_reason,
+    (0.65 + 0.05 * (CAST(length(:q) AS REAL) / CASE WHEN length(COALESCE(m.composition_normalized, '')) > 1 THEN length(m.composition_normalized) ELSE 1 END)) AS score
+FROM medicines m
+WHERE (m.composition_normalized LIKE (:q || '%') OR m.composition_normalized LIKE ('% ' || :q || '%'))
+  AND (NOT :active_only OR NOT m.is_discontinued)
+  AND (:min_price IS NULL OR m.price >= :min_price)
+  AND (:max_price IS NULL OR m.price <= :max_price)
+  AND (:mfr IS NULL OR m.manufacturer_normalized LIKE ('%' || :mfr || '%') OR m.manufacturer_name LIKE ('%' || :mfr || '%'))
+  AND (:form IS NULL OR m.name_normalized LIKE ('%' || :form || '%') OR m.pack_size_label LIKE ('%' || :form || '%'))
+ORDER BY m.is_discontinued ASC,
+         COALESCE(m.selection_count, 0) DESC,
+         CASE WHEN m.short_composition2 IS NULL OR m.short_composition2 = '' THEN 0 ELSE 1 END,
+         length(m.name_normalized)
+LIMIT :remaining
+""")
+
+SQLITE_PREFIX_MANUFACTURER_QUERY = text("""
+SELECT
+    CAST(m.id AS TEXT) AS medicine_id,
+    m.source_id,
+    m.name,
+    m.manufacturer_name,
+    COALESCE(m.short_composition1, '') ||
+        CASE WHEN m.short_composition2 IS NOT NULL AND m.short_composition2 != ''
+            THEN ' + ' || m.short_composition2
+            ELSE ''
+        END AS composition,
+    m.pack_size_label,
+    CAST(m.price AS REAL) AS price,
+    m.is_discontinued,
+    6 AS match_tier,
+    'manufacturer' AS matched_on,
+    'manufacturer_match' AS match_reason,
+    (0.45 + 0.05 * (CAST(length(:q) AS REAL) / CASE WHEN length(COALESCE(m.manufacturer_normalized, '')) > 1 THEN length(m.manufacturer_normalized) ELSE 1 END)) AS score
+FROM medicines m
+WHERE (m.manufacturer_normalized LIKE (:q || '%') OR m.manufacturer_normalized LIKE ('% ' || :q || '%'))
+  AND (NOT :active_only OR NOT m.is_discontinued)
+  AND (:min_price IS NULL OR m.price >= :min_price)
+  AND (:max_price IS NULL OR m.price <= :max_price)
+  AND (:mfr IS NULL OR m.manufacturer_normalized LIKE ('%' || :mfr || '%') OR m.manufacturer_name LIKE ('%' || :mfr || '%'))
+  AND (:form IS NULL OR m.name_normalized LIKE ('%' || :form || '%') OR m.pack_size_label LIKE ('%' || :form || '%'))
+ORDER BY m.is_discontinued ASC, COALESCE(m.selection_count, 0) DESC, length(m.name_normalized)
+LIMIT :remaining
 """)
 
 
-# ============================================================
-# POSTGRESQL IMPLEMENTATION
-# ============================================================
-
-async def search_medicines_postgres(
-    session: AsyncSession,
-    q_norm: str,
-    limit: int = 10,
-    *,
-    similarity_threshold: float = 0.25,
-) -> list[SearchResult]:
-    """
-    Search medicines on PostgreSQL strictly adhering to the 3-parameter priority:
-    1. Medicine Name (Top priority: Exact, Prefix, Alias, Token, Typo)
-    2. Composition (Middle priority: Prefix, Substring, Fuzzy)
-    3. Company / Manufacturer (Bottom priority: Prefix, Substring, Fuzzy)
-
-    Each parameter's results are collected into a separate bucket, sorted internally
-    by name-similarity to the query (closest match first), then concatenated strictly:
-    name_bucket → composition_bucket → manufacturer_bucket.
-    """
-    seen_ids: set[str] = set()
-    name_bucket: list[SearchResult] = []
-    comp_bucket: list[SearchResult] = []
-    mfr_bucket: list[SearchResult] = []
-
-    def make_and_add(row, bucket: list, match_param: str):
-        """Create a SearchResult and add to the given bucket if not already seen."""
-        if row.medicine_id in seen_ids:
-            return
-        seen_ids.add(row.medicine_id)
-        bucket.append(
-            SearchResult(
-                medicine_id=row.medicine_id,
-                source_id=row.source_id,
-                name=row.name,
-                manufacturer_name=row.manufacturer_name,
-                composition=row.composition,
-                pack_size_label=row.pack_size_label,
-                price=row.price,
-                is_discontinued=row.is_discontinued,
-                match_parameter=getattr(row, "match_parameter", match_param),
-                match_reason=row.match_reason,
-                score=round(row.score, 4),
-            )
+def sort_bucket(bucket: list[SearchResult]) -> None:
+    """Sort matches inside a tier per Section 3.3 and Phase 4 popularity."""
+    bucket.sort(
+        key=lambda r: (
+            1 if r.is_discontinued else 0,
+            -r.score,
+            len(r.name),
+            r.name,
         )
+    )
 
-    def name_sim(r: SearchResult) -> float:
-        """Name-similarity of the medicine name to the user query (higher = better)."""
-        return difflib.SequenceMatcher(None, q_norm, r.name.lower()).ratio()
-
-    def sort_bucket(bucket: list[SearchResult]) -> list[SearchResult]:
-        """
-        Sort within a bucket:
-          1. Score DESC  (exact > prefix > token > typo within name tier)
-          2. Name-similarity DESC  (name closest to query string first)
-          3. Name length ASC  (shorter / simpler name first)
-        """
-        bucket.sort(key=lambda r: (-r.score, -name_sim(r), len(r.name)))
-        return bucket
-
-    # ──────────────────────────────────────────────────────────
-    # PARAMETER 1: MEDICINE NAME
-    # ──────────────────────────────────────────────────────────
-
-    # 1A. Exact Name Match (<0.5ms via B-Tree)
-    exact_res = await session.execute(PG_EXACT_NAME_QUERY, {"q": q_norm, "limit": limit})
-    for row in exact_res.fetchall():
-        make_and_add(row, name_bucket, "name")
-
-    if name_bucket and name_bucket[0].match_reason == "exact_name" and len(name_bucket) >= limit:
-        return name_bucket[:limit]
-
-    # 1B. Prefix Name Match
-    remaining = limit - len(name_bucket)
-    if remaining > 0:
-        existing_list = list(seen_ids) if seen_ids else None
-        prefix_res = await session.execute(
-            PG_PREFIX_NAME_QUERY,
-            {"q": q_norm, "remaining": remaining, "existing_ids": existing_list},
-        )
-        for row in prefix_res.fetchall():
-            make_and_add(row, name_bucket, "name")
-
-    # 1C. Exact & Prefix Name Alias Match
-    remaining = limit - len(name_bucket)
-    if remaining > 0:
-        existing_list = list(seen_ids) if seen_ids else None
-        alias_res = await session.execute(
-            PG_ALIAS_QUERY,
-            {"q": q_norm, "remaining": remaining, "existing_ids": existing_list},
-        )
-        for row in alias_res.fetchall():
-            make_and_add(row, name_bucket, "name")
-
-    # 1D. Word / Token Match on Name
-    remaining = limit - len(name_bucket)
-    if remaining > 0 and len(q_norm) >= 3:
-        existing_list = list(seen_ids) if seen_ids else None
-        token_res = await session.execute(
-            PG_TOKEN_NAME_QUERY,
-            {"q": q_norm, "remaining": remaining, "existing_ids": existing_list},
-        )
-        for row in token_res.fetchall():
-            make_and_add(row, name_bucket, "name")
-
-    # 1E. Fuzzy / Typo Match on Name
-    remaining = limit - len(name_bucket)
-    if remaining > 0 and len(q_norm) >= 3:
-        existing_list = list(seen_ids) if seen_ids else None
-        words = re.findall(r"[a-z]+", q_norm)
-        numbers = re.findall(r"\d+", q_norm)
-
-        if words and numbers:
-            brand_q = " ".join(words)
-            num_q = numbers[0]
-            fuzzy_decomp_res = await session.execute(
-                PG_FUZZY_DECOMPOSED_QUERY,
-                {
-                    "q": q_norm,
-                    "brand_q": brand_q,
-                    "num_q": num_q,
-                    "remaining": remaining,
-                    "existing_ids": existing_list,
-                },
-            )
-            for row in fuzzy_decomp_res.fetchall():
-                make_and_add(row, name_bucket, "name")
-
-        remaining = limit - len(name_bucket)
-        if remaining > 0:
-            existing_list = list(seen_ids) if seen_ids else None
-            fuzzy_name_res = await session.execute(
-                PG_FUZZY_NAME_QUERY,
-                {"q": q_norm, "remaining": remaining, "existing_ids": existing_list},
-            )
-            for row in fuzzy_name_res.fetchall():
-                make_and_add(row, name_bucket, "name")
-
-    # Sort name bucket: score DESC → name-similarity DESC → name-length ASC
-    sort_bucket(name_bucket)
-
-    # If Name bucket fills the limit → return immediately (no comp/company pollution)
-    if len(name_bucket) >= limit:
-        return name_bucket[:limit]
-
-    # ──────────────────────────────────────────────────────────
-    # PARAMETER 2: COMPOSITION
-    # (Only executed if Name matches didn't completely fill limit)
-    # ──────────────────────────────────────────────────────────
-    remaining = limit - len(name_bucket)
-    if remaining > 0 and len(q_norm) >= 3:
-        existing_list = list(seen_ids) if seen_ids else None
-
-        # 2A. Prefix on composition
-        comp_prefix_res = await session.execute(
-            PG_PREFIX_COMPOSITION_QUERY,
-            {"q": q_norm, "remaining": remaining, "existing_ids": existing_list},
-        )
-        for row in comp_prefix_res.fetchall():
-            make_and_add(row, comp_bucket, "composition")
-
-        # 2B. Fuzzy / Substring on composition
-        remaining = limit - len(name_bucket) - len(comp_bucket)
-        if remaining > 0 and len(q_norm) >= 4:
-            existing_list = list(seen_ids) if seen_ids else None
-            comp_fuzzy_res = await session.execute(
-                PG_FUZZY_COMPOSITION_QUERY,
-                {"q": q_norm, "remaining": remaining, "existing_ids": existing_list},
-            )
-            for row in comp_fuzzy_res.fetchall():
-                make_and_add(row, comp_bucket, "composition")
-
-    # Sort composition bucket by name-similarity to query
-    sort_bucket(comp_bucket)
-
-    if len(name_bucket) + len(comp_bucket) >= limit:
-        return (name_bucket + comp_bucket)[:limit]
-
-    # ──────────────────────────────────────────────────────────
-    # PARAMETER 3: COMPANY / MANUFACTURER
-    # (Only executed if Name + Composition matches < limit)
-    # ──────────────────────────────────────────────────────────
-    remaining = limit - len(name_bucket) - len(comp_bucket)
-    if remaining > 0 and len(q_norm) >= 3:
-        existing_list = list(seen_ids) if seen_ids else None
-
-        # 3A. Prefix on manufacturer
-        mfr_prefix_res = await session.execute(
-            PG_PREFIX_MANUFACTURER_QUERY,
-            {"q": q_norm, "remaining": remaining, "existing_ids": existing_list},
-        )
-        for row in mfr_prefix_res.fetchall():
-            make_and_add(row, mfr_bucket, "manufacturer")
-
-        # 3B. Fuzzy on manufacturer
-        remaining = limit - len(name_bucket) - len(comp_bucket) - len(mfr_bucket)
-        if remaining > 0 and len(q_norm) >= 4:
-            existing_list = list(seen_ids) if seen_ids else None
-            mfr_fuzzy_res = await session.execute(
-                PG_FUZZY_MANUFACTURER_QUERY,
-                {"q": q_norm, "remaining": remaining, "existing_ids": existing_list},
-            )
-            for row in mfr_fuzzy_res.fetchall():
-                make_and_add(row, mfr_bucket, "manufacturer")
-
-    # Sort manufacturer bucket by name-similarity to query
-    sort_bucket(mfr_bucket)
-
-    # ── Final: strict 3-parameter order — Name → Composition → Manufacturer ──
-    return (name_bucket + comp_bucket + mfr_bucket)[:limit]
-
-
-# ============================================================
-# SQLITE IMPLEMENTATION
-# ============================================================
 
 async def search_medicines_sqlite(
     session: AsyncSession,
     q_norm: str,
+    tokens: list[str],
+    query_orig: str,
     limit: int = 10,
-    *,
-    similarity_threshold: float = 0.25,
+    fields: list[str] | None = None,
+    active_only: bool = False,
+    min_price: float | None = None,
+    max_price: float | None = None,
+    manufacturer: str | None = None,
+    form: str | None = None,
 ) -> list[SearchResult]:
-    """
-    Search medicines on SQLite fallback database strictly adhering to the 3-parameter priority.
+    """Execute SQLite search ladder matching ranking tiers."""
+    if fields is None:
+        fields = ["name", "composition", "manufacturer"]
 
-    Results are collected into 3 separate buckets:
-      name_bucket → composition_bucket → manufacturer_bucket
-    Each bucket is sorted by name-similarity to the query before concatenation.
-    """
-    seen_ids: set[str] = set()
+    v_has_name = "name" in fields
+    v_has_comp = "composition" in fields
+    v_has_mfr = "manufacturer" in fields
+
     name_bucket: list[SearchResult] = []
     comp_bucket: list[SearchResult] = []
     mfr_bucket: list[SearchResult] = []
+    seen_ids: set[str] = set()
 
-    def make_and_add(row, bucket: list, match_param: str, *, is_disc: bool | None = None):
-        if row.medicine_id in seen_ids:
-            return
-        seen_ids.add(row.medicine_id)
-        bucket.append(
-            SearchResult(
-                medicine_id=row.medicine_id,
-                source_id=row.source_id,
-                name=row.name,
-                manufacturer_name=row.manufacturer_name,
-                composition=row.composition,
-                pack_size_label=row.pack_size_label,
-                price=row.price,
-                is_discontinued=bool(row.is_discontinued) if is_disc is None else is_disc,
-                match_parameter=getattr(row, "match_parameter", match_param),
-                match_reason=row.match_reason,
-                score=round(row.score, 4),
-            )
-        )
+    params_base = {
+        "active_only": active_only,
+        "min_price": min_price,
+        "max_price": max_price,
+        "mfr": manufacturer,
+        "form": form,
+    }
 
-    def name_sim(r: SearchResult) -> float:
-        return difflib.SequenceMatcher(None, q_norm, r.name.lower()).ratio()
-
-    def sort_bucket(bucket: list[SearchResult]) -> list[SearchResult]:
-        bucket.sort(key=lambda r: (-r.score, -name_sim(r), len(r.name)))
-        return bucket
-
-    # ──────────────────────────────────────────────────
-    # PARAMETER 1: MEDICINE NAME
-    # ──────────────────────────────────────────────────
-
-    # 1A. Exact Name
-    exact_res = await session.execute(SQLITE_EXACT_NAME_QUERY, {"q": q_norm, "limit": limit})
-    for row in exact_res.fetchall():
-        make_and_add(row, name_bucket, "name")
-
-    if name_bucket and name_bucket[0].match_reason == "exact_name" and len(name_bucket) >= limit:
-        return name_bucket[:limit]
-
-    # 1B. Prefix Name
-    remaining = limit - len(name_bucket)
-    if remaining > 0:
-        prefix_res = await session.execute(SQLITE_PREFIX_NAME_QUERY, {"q": q_norm, "remaining": remaining})
-        for row in prefix_res.fetchall():
-            make_and_add(row, name_bucket, "name")
-
-    # 1C. Exact/Prefix Alias
-    remaining = limit - len(name_bucket)
-    if remaining > 0:
-        alias_res = await session.execute(SQLITE_ALIAS_QUERY, {"q": q_norm, "remaining": remaining})
-        for row in alias_res.fetchall():
-            make_and_add(row, name_bucket, "name")
-
-    # 1D. Token Name
-    remaining = limit - len(name_bucket)
-    if remaining > 0 and len(q_norm) >= 3:
-        token_res = await session.execute(SQLITE_TOKEN_NAME_QUERY, {"q": q_norm, "remaining": remaining})
-        for row in token_res.fetchall():
-            make_and_add(row, name_bucket, "name")
-
-    # 1E. Fuzzy/Typo on Name via difflib SequenceMatcher
-    remaining = limit - len(name_bucket)
-    if remaining > 0:
-        words = re.findall(r"[a-z]+", q_norm)
-        numbers = re.findall(r"\d+", q_norm)
-        first_char = q_norm[0] if q_norm else ""
-        first_word = words[0] if words else ""
-        first_num = numbers[0] if numbers else ""
-
-        cand_res = await session.execute(
-            SQLITE_CANDIDATES_QUERY,
-            {
-                "first_char": first_char,
-                "word": first_word[:4] if len(first_word) >= 4 else first_word,
-                "num": first_num,
-            },
-        )
-        candidates = cand_res.fetchall()
-        scored_candidates = []
-        for cand in candidates:
-            if cand.medicine_id in seen_ids:
-                continue
-            sim = difflib.SequenceMatcher(None, q_norm, cand.name_normalized).ratio()
-            if sim >= 0.35:
-                scored_candidates.append((cand, sim))
-
-        # Sort by similarity DESC, then name length ASC for tie-breaking
-        scored_candidates.sort(key=lambda x: (-x[1], len(x[0].name)))
-        for cand, sim in scored_candidates[:remaining]:
-            seen_ids.add(cand.medicine_id)
-            name_bucket.append(
+    def add_row(row, target_bucket: list[SearchResult], default_param: str, default_tier: int) -> None:
+        med_id = str(row.medicine_id)
+        if med_id not in seen_ids:
+            seen_ids.add(med_id)
+            target_bucket.append(
                 SearchResult(
-                    medicine_id=cand.medicine_id,
-                    source_id=cand.source_id,
-                    name=cand.name,
-                    manufacturer_name=cand.manufacturer_name,
-                    composition=cand.composition,
-                    pack_size_label=cand.pack_size_label,
-                    price=cand.price,
-                    is_discontinued=bool(cand.is_discontinued),
-                    match_parameter="name",
-                    match_reason="typo_match",
-                    score=round(0.75 + 0.09 * sim, 4),
+                    medicine_id=med_id,
+                    source_id=row.source_id,
+                    name=row.name,
+                    manufacturer_name=row.manufacturer_name,
+                    composition=row.composition if row.composition else None,
+                    pack_size_label=row.pack_size_label,
+                    price=float(row.price) if row.price is not None else None,
+                    is_discontinued=bool(row.is_discontinued),
+                    match_parameter=getattr(row, "matched_on", default_param),
+                    match_reason=getattr(row, "match_reason", "prefix"),
+                    score=round(float(row.score), 4),
+                    match_tier=int(getattr(row, "match_tier", default_tier)),
+                    matched_on=getattr(row, "matched_on", default_param),
+                    corrected_query=None,
+                    low_confidence=False,
                 )
             )
 
-    # Sort name bucket: score DESC → name-similarity DESC → name-length ASC
-    sort_bucket(name_bucket)
+    # 1. Exact Name (T0)
+    if v_has_name:
+        res = await session.execute(
+            SQLITE_EXACT_NAME_QUERY,
+            {"q": q_norm, "q_orig": query_orig, "limit": limit, **params_base},
+        )
+        for r in res.fetchall():
+            add_row(r, name_bucket, "name", 0)
 
-    # If Name bucket fills the limit → return immediately!
-    if len(name_bucket) >= limit:
-        return name_bucket[:limit]
+        if len(name_bucket) >= limit:
+            sort_bucket(name_bucket)
+            return name_bucket[:limit]
 
-    # ──────────────────────────────────────────────────
-    # PARAMETER 2: COMPOSITION
-    # ──────────────────────────────────────────────────
+        # 2. Prefix Name (T1)
+        remaining = limit - len(name_bucket)
+        res = await session.execute(
+            SQLITE_PREFIX_NAME_QUERY,
+            {"q": q_norm, "remaining": remaining, **params_base},
+        )
+        for r in res.fetchall():
+            add_row(r, name_bucket, "name", 1)
+
+        if len(name_bucket) >= limit:
+            sort_bucket(name_bucket)
+            return name_bucket[:limit]
+
+        # 3. Cross-Field AND (T4)
+        if len(tokens) >= 2:
+            t0, t1 = tokens[0], tokens[1]
+            remaining = limit - len(name_bucket)
+            res = await session.execute(
+                SQLITE_CROSS_NAME_MFR_QUERY,
+                {"name_token": t0, "mfr_token": t1, "remaining": remaining, **params_base},
+            )
+            for r in res.fetchall():
+                add_row(r, name_bucket, "name", 4)
+
+            remaining = limit - len(name_bucket)
+            if remaining > 0:
+                res = await session.execute(
+                    SQLITE_CROSS_NAME_COMP_QUERY,
+                    {"name_token": t0, "comp_token": t1, "remaining": remaining, **params_base},
+                )
+                for r in res.fetchall():
+                    add_row(r, name_bucket, "name", 4)
+
+        if len(name_bucket) >= limit:
+            sort_bucket(name_bucket)
+            return name_bucket[:limit]
+
+        # 4. Word Token Match (T3)
+        remaining = limit - len(name_bucket)
+        if remaining > 0:
+            res = await session.execute(
+                SQLITE_WORD_TOKEN_QUERY,
+                {"q": q_norm, "remaining": remaining, **params_base},
+            )
+            for r in res.fetchall():
+                add_row(r, name_bucket, "name", 3)
+
+        if len(name_bucket) >= limit:
+            sort_bucket(name_bucket)
+            return name_bucket[:limit]
+
+        # 5. Fuzzy / Typo Candidates (T2)
+        remaining = limit - len(name_bucket)
+        if remaining > 0 and len(q_norm) >= 4:
+            words = [t for t in tokens if t.isalpha()]
+            numbers = [t for t in tokens if t.isdigit()]
+            first_char = q_norm[0] if q_norm else ""
+            first_word = words[0] if words else ""
+            first_num = numbers[0] if numbers else ""
+
+            cand_res = await session.execute(
+                SQLITE_CANDIDATES_QUERY,
+                {
+                    "first_char": first_char,
+                    "word": first_word[:4] if len(first_word) >= 4 else first_word,
+                    "num": first_num,
+                    **params_base,
+                },
+            )
+            candidates = cand_res.fetchall()
+            scored_candidates = []
+            for cand in candidates:
+                if str(cand.medicine_id) in seen_ids:
+                    continue
+                sim = difflib.SequenceMatcher(None, q_norm, cand.name_normalized).ratio()
+                if sim >= 0.40:
+                    scored_candidates.append((cand, sim))
+
+            scored_candidates.sort(key=lambda x: (1 if x[0].is_discontinued else 0, -x[0].selection_count, -x[1], len(x[0].name)))
+            for cand, sim in scored_candidates[:remaining]:
+                seen_ids.add(str(cand.medicine_id))
+                name_bucket.append(
+                    SearchResult(
+                        medicine_id=str(cand.medicine_id),
+                        source_id=cand.source_id,
+                        name=cand.name,
+                        manufacturer_name=cand.manufacturer_name,
+                        composition=cand.composition if cand.composition else None,
+                        pack_size_label=cand.pack_size_label,
+                        price=float(cand.price) if cand.price is not None else None,
+                        is_discontinued=bool(cand.is_discontinued),
+                        match_parameter="name",
+                        match_reason="typo_match",
+                        score=round(0.75 + 0.09 * sim, 4),
+                        match_tier=2,
+                        matched_on="name",
+                        corrected_query=None,
+                        low_confidence=False,
+                    )
+                )
+
+        sort_bucket(name_bucket)
+        if len(name_bucket) >= limit:
+            return name_bucket[:limit]
+
+    # 6. Composition (T5)
     remaining = limit - len(name_bucket)
-    if remaining > 0 and len(q_norm) >= 3:
+    if v_has_comp and remaining > 0 and len(q_norm) >= 3:
+        target_salt = KNOWN_INGREDIENT_TYPOS.get(q_norm, q_norm)
         comp_res = await session.execute(
             SQLITE_PREFIX_COMPOSITION_QUERY,
-            {"q": q_norm, "remaining": remaining},
+            {"q": target_salt, "remaining": remaining, **params_base},
         )
         for row in comp_res.fetchall():
-            make_and_add(row, comp_bucket, "composition")
+            add_row(row, comp_bucket, "composition", 5)
 
     sort_bucket(comp_bucket)
-
     if len(name_bucket) + len(comp_bucket) >= limit:
         return (name_bucket + comp_bucket)[:limit]
 
-    # ──────────────────────────────────────────────────
-    # PARAMETER 3: COMPANY / MANUFACTURER
-    # ──────────────────────────────────────────────────
+    # 7. Manufacturer (T6)
     remaining = limit - len(name_bucket) - len(comp_bucket)
-    if remaining > 0 and len(q_norm) >= 3:
+    if v_has_mfr and remaining > 0 and len(q_norm) >= 3:
         mfr_res = await session.execute(
             SQLITE_PREFIX_MANUFACTURER_QUERY,
-            {"q": q_norm, "remaining": remaining},
+            {"q": q_norm, "remaining": remaining, **params_base},
         )
         for row in mfr_res.fetchall():
-            make_and_add(row, mfr_bucket, "manufacturer")
+            add_row(row, mfr_bucket, "manufacturer", 6)
 
     sort_bucket(mfr_bucket)
-
-    # Final: strict 3-parameter order — Name → Composition → Manufacturer
     return (name_bucket + comp_bucket + mfr_bucket)[:limit]
 
 
+# ============================================================
+# PHASE 4: SHOP INVENTORY & FEEDBACK HELPERS
+# ============================================================
+
+async def get_shop_inventory_for_medicines(
+    session: AsyncSession,
+    shop_id: str,
+    medicine_ids: list[str],
+) -> dict[str, dict]:
+    """Look up shop inventory and pricing for candidate medicines."""
+    if not shop_id or not medicine_ids:
+        return {}
+
+    bind = session.bind
+    dialect = bind.dialect.name if bind else "postgresql"
+
+    if dialect == "sqlite":
+        res = await session.execute(
+            text("""
+            SELECT
+                CAST(medicine_id AS TEXT) AS medicine_id,
+                quantity,
+                is_in_stock,
+                CAST(custom_price AS REAL) AS custom_price
+            FROM shop_inventory
+            WHERE shop_id = :shop_id
+            """),
+            {"shop_id": shop_id},
+        )
+    else:
+        res = await session.execute(
+            text("""
+            SELECT
+                medicine_id::text AS medicine_id,
+                quantity,
+                is_in_stock,
+                custom_price::float8 AS custom_price
+            FROM shop_inventory
+            WHERE shop_id = :shop_id
+              AND medicine_id::text = ANY(:ids)
+            """),
+            {"shop_id": shop_id, "ids": medicine_ids},
+        )
+
+    inv_map: dict[str, dict] = {}
+    for row in res.fetchall():
+        inv_map[str(row.medicine_id)] = {
+            "quantity": row.quantity,
+            "is_in_stock": bool(row.is_in_stock),
+            "custom_price": float(row.custom_price) if row.custom_price is not None else None,
+        }
+    return inv_map
+
+
+async def record_search_selection(
+    session: AsyncSession,
+    query: str,
+    medicine_id: str,
+    shop_id: str | None = None,
+    rank_selected: int = 1,
+) -> tuple[int, bool]:
+    """
+    Record user selection feedback event for ranking popularity and alias auto-learning.
+    Returns (updated_selection_count, learned_alias).
+    """
+    q_norm, _ = normalize_query(query)
+    q_norm_clean = q_norm if q_norm else query.strip().lower()
+    event_id = str(uuid.uuid4())
+    med_uuid = uuid.UUID(medicine_id) if isinstance(medicine_id, str) and len(medicine_id) == 36 else medicine_id
+
+    # 1. Insert selection event
+    await session.execute(
+        text("""
+        INSERT INTO search_selections (id, query_text, query_normalized, medicine_id, shop_id, rank_selected, selected_at)
+        VALUES (:id, :q_text, :q_norm, :med_id, :shop_id, :rank, now())
+        """),
+        {
+            "id": event_id,
+            "q_text": query,
+            "q_norm": q_norm_clean,
+            "med_id": med_uuid,
+            "shop_id": shop_id,
+            "rank": rank_selected,
+        },
+    )
+
+    # 2. Increment selection count on medicine
+    res = await session.execute(
+        text("""
+        UPDATE medicines
+        SET selection_count = COALESCE(selection_count, 0) + 1
+        WHERE id = :med_id
+        RETURNING selection_count
+        """),
+        {"med_id": med_uuid},
+    )
+    row = res.fetchone()
+    count = row[0] if row else 1
+
+    # 3. Check for alias auto-learning (if query was selected >= 2 times for this medicine)
+    count_res = await session.execute(
+        text("""
+        SELECT count(*) FROM search_selections
+        WHERE query_normalized = :q_norm AND medicine_id = :med_id
+        """),
+        {"q_norm": q_norm_clean, "med_id": med_uuid},
+    )
+    select_count_for_query = count_res.scalar() or 0
+
+    learned_alias = False
+    if select_count_for_query >= 2:
+        alias_id = str(uuid.uuid4())
+        await session.execute(
+            text("""
+            INSERT INTO medicine_aliases (id, medicine_id, alias, alias_normalized, alias_type, review_status, created_at)
+            VALUES (:id, :med_id, :alias, :alias_norm, 'usage_learned', 'active', now())
+            ON CONFLICT DO NOTHING
+            """),
+            {
+                "id": alias_id,
+                "med_id": med_uuid,
+                "alias": query,
+                "alias_norm": q_norm_clean,
+            },
+        )
+        learned_alias = True
+
+    await session.commit()
+
+    # Invalidate cache so updated popularity takes effect immediately
+    SEARCH_CACHE.clear()
+
+    return count, learned_alias
+
+
+async def update_shop_inventory_items(
+    session: AsyncSession,
+    shop_id: str,
+    items: list[dict],
+) -> int:
+    """Update or insert shop inventory items."""
+    updated = 0
+    for it in items:
+        med_id = it["medicine_id"]
+        med_uuid = uuid.UUID(med_id) if isinstance(med_id, str) and len(med_id) == 36 else med_id
+        await session.execute(
+            text("""
+            INSERT INTO shop_inventory (id, shop_id, medicine_id, quantity, is_in_stock, custom_price, updated_at)
+            VALUES (:id, :shop_id, :med_id, :qty, :in_stock, :price, now())
+            ON CONFLICT (shop_id, medicine_id)
+            DO UPDATE SET
+                quantity = EXCLUDED.quantity,
+                is_in_stock = EXCLUDED.is_in_stock,
+                custom_price = EXCLUDED.custom_price,
+                updated_at = now()
+            """),
+            {
+                "id": str(uuid.uuid4()),
+                "shop_id": shop_id,
+                "med_id": med_uuid,
+                "qty": it.get("quantity", 0),
+                "in_stock": it.get("is_in_stock", True),
+                "price": it.get("custom_price"),
+            },
+        )
+        updated += 1
+    await session.commit()
+    SEARCH_CACHE.clear()
+    return updated
+
 
 # ============================================================
-# MAIN SEARCH ENTRY POINT WITH LRU CACHING
+# MAIN SEARCH ENTRY POINT
 # ============================================================
 
 async def search_medicines(
@@ -892,45 +807,87 @@ async def search_medicines(
     query: str,
     limit: int = 10,
     *,
-    similarity_threshold: float = 0.25,
+    fields: list[str] | None = None,
+    active_only: bool = False,
+    min_price: float | None = None,
+    max_price: float | None = None,
+    manufacturer: str | None = None,
+    form: str | None = None,
+    shop_id: str | None = None,
+    similarity_threshold: float = 0.35,
 ) -> list[SearchResult]:
     """
-    Search medicines strictly across 3 prioritized parameters:
-    1. Medicine Name
-    2. Composition
-    3. Company / Manufacturer
-
-    Employs an in-memory cache for instant (<5ms) responses on repeated queries.
+    Search medicines across the 8-tier ranking ladder (T0-T7) with popularity & inventory boost.
     """
-    q_norm = normalize_medicine_name(query)
-    if not q_norm:
+    q_norm, tokens = normalize_query(query)
+    if not q_norm or not tokens:
         return []
+
+    if fields is None:
+        fields = ["name", "composition", "manufacturer"]
 
     bind = session.bind
     dialect = bind.dialect.name if bind else "postgresql"
-    cache_key = f"{dialect}:{limit}:{q_norm}"
 
-    # Check LRU cache
-    now = time.time()
-    if cache_key in _CACHE:
-        cached_time, cached_res = _CACHE[cache_key]
-        if now - cached_time < _CACHE_TTL_SECONDS:
-            return cached_res
+    # Cache key per specification
+    cache_key = (
+        tuple(tokens),
+        limit,
+        tuple(sorted(fields)),
+        active_only,
+        min_price,
+        max_price,
+        manufacturer,
+        form,
+        shop_id,
+        dialect,
+    )
+
+    if cache_key in SEARCH_CACHE:
+        return SEARCH_CACHE[cache_key]
 
     if dialect == "sqlite":
         results = await search_medicines_sqlite(
-            session, q_norm, limit=limit, similarity_threshold=similarity_threshold
+            session=session,
+            q_norm=q_norm,
+            tokens=tokens,
+            query_orig=query,
+            limit=limit,
+            fields=fields,
+            active_only=active_only,
+            min_price=min_price,
+            max_price=max_price,
+            manufacturer=manufacturer,
+            form=form,
         )
     else:
         results = await search_medicines_postgres(
-            session, q_norm, limit=limit, similarity_threshold=similarity_threshold
+            session=session,
+            tokens=tokens,
+            limit=limit,
+            fields=fields,
+            active_only=active_only,
+            min_price=min_price,
+            max_price=max_price,
+            manufacturer=manufacturer,
+            form=form,
         )
 
-    # Store in cache
-    if len(_CACHE) >= _MAX_CACHE_SIZE:
-        # Evict oldest entry
-        oldest_key = min(_CACHE.keys(), key=lambda k: _CACHE[k][0])
-        _CACHE.pop(oldest_key, None)
-    _CACHE[cache_key] = (now, results)
+    # Decorate with shop inventory context if shop_id provided
+    if shop_id and results:
+        inv_map = await get_shop_inventory_for_medicines(
+            session, shop_id, [r.medicine_id for r in results]
+        )
+        for r in results:
+            if r.medicine_id in inv_map:
+                inv = inv_map[r.medicine_id]
+                r.in_stock = inv["is_in_stock"]
+                r.stock_quantity = inv["quantity"]
+                if inv["custom_price"] is not None:
+                    r.custom_price = inv["custom_price"]
+            else:
+                r.in_stock = False
+                r.stock_quantity = 0
 
+    SEARCH_CACHE[cache_key] = results
     return results

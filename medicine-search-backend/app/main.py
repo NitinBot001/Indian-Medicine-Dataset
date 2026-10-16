@@ -1,9 +1,11 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
+from app.core.config import get_settings
 from app.db.session import db_manager
 from app.api.v1.routes.search import router as search_router
 from app.api.v1.routes.catalog import router as catalog_router
@@ -32,11 +34,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — allow all origins in development
+# CORS — standard API security configuration (wildcard origins with credentials=False)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -61,11 +63,40 @@ async def root():
 
 
 @app.get("/health")
-async def health():
-    """Basic health check with active database dialect info."""
+async def health(response: Response):
+    """
+    Health check endpoint with loud fallback degradation detection.
+    Returns 503 Service Unavailable if degraded to SQLite fallback with <= 21 rows
+    unless ALLOW_TINY_FALLBACK=true.
+    """
+    settings = get_settings()
+    is_fallback = db_manager.is_fallback
+    row_count = None
+
+    if is_fallback:
+        try:
+            async with db_manager.session() as session:
+                res = await session.execute(text("SELECT count(*) FROM medicines"))
+                row_count = res.scalar() or 0
+        except Exception as e:
+            logger.error(f"Error checking medicine count during health check: {e}")
+            row_count = 0
+
+        if row_count <= 21 and not settings.ALLOW_TINY_FALLBACK:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            return {
+                "status": "degraded",
+                "database": "fallback_sqlite",
+                "dialect": db_manager.active_dialect,
+                "is_fallback": True,
+                "row_count": row_count,
+                "error": "PostgreSQL is unreachable and catalogue is running on tiny SQLite fallback (<= 21 rows). Set ALLOW_TINY_FALLBACK=true to allow."
+            }
+
     return {
         "status": "ok",
         "database": "connected",
         "dialect": db_manager.active_dialect,
-        "is_fallback": db_manager.is_fallback,
+        "is_fallback": is_fallback,
+        "row_count": row_count,
     }

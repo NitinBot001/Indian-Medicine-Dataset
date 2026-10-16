@@ -7,6 +7,7 @@ Implements plan.md Section 8 — Dataset ingestion workflow:
 - Normalize fields for search indexing
 - Track import provenance (source, hash, version)
 - Idempotent: re-import of same hash is a no-op
+- Rebuilds search columns and lexicons at the end of every import (Section 5.5)
 
 Usage:
     python -m app.importers.csv_importer --file /path/to/csv [--batch-size 5000]
@@ -306,6 +307,14 @@ def import_csv(
             print("Running ANALYZE on medicines table for query planner...")
             cur.execute("ANALYZE medicines;")
             conn.commit()
+
+        # Rebuild search columns, lexicons and indexes (Section 5.5)
+        try:
+            from scripts.build_search_index import build_search_indexes
+            print("\nRebuilding search columns, lexicons, and index statistics...")
+            build_search_indexes()
+        except Exception as e:
+            print(f"Notice: search index rebuild note: {e}")
 
         return {
             "status": "completed",

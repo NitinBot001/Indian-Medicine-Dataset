@@ -21,13 +21,27 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# Standard CORS configuration (wildcard origins with credentials=False)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "content-encoding",
+    "content-length",
+}
 
 
 @app.get("/gateway/health")
@@ -53,7 +67,8 @@ async def gateway_health():
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def proxy_to_backend(request: Request, path: str):
     """
-    Transparently forward all public API requests to the internal medicine-search-backend service.
+    Transparently forward all public API requests to the internal medicine-search-backend service,
+    stripping hop-by-hop headers to prevent encoding conflicts.
     """
     query_params = str(request.url.query)
     url_path = f"/{path}" + (f"?{query_params}" if query_params else "")
@@ -70,10 +85,17 @@ async def proxy_to_backend(request: Request, path: str):
                 content=req_body,
                 headers=headers,
             )
+
+            # Strip hop-by-hop and encoding headers
+            response_headers = {
+                k: v for k, v in resp.headers.items()
+                if k.lower() not in HOP_BY_HOP_HEADERS
+            }
+
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
-                headers=dict(resp.headers),
+                headers=response_headers,
                 media_type=resp.headers.get("content-type"),
             )
     except httpx.RequestError as e:

@@ -115,6 +115,7 @@ class Settings(BaseSettings):
     # Application
     APP_NAME: str = "Medicine Search API"
     DEBUG: bool = False
+    ALLOW_TINY_FALLBACK: bool = False
 
     @property
     def primary_postgres_url(self) -> str | None:

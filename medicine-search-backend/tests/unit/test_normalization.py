@@ -1,13 +1,15 @@
 """
-Unit tests for text normalization (plan.md Section 6).
+Unit tests for text normalization (plan.md Section 6 and Section 3.1).
 """
 
 from app.services.normalization import (
-    normalize_text,
-    normalize_medicine_name,
-    normalize_manufacturer,
-    normalize_composition,
+    escape_like,
     extract_strength,
+    normalize_composition,
+    normalize_manufacturer,
+    normalize_medicine_name,
+    normalize_query,
+    normalize_text,
     parse_ingredient,
 )
 
@@ -68,3 +70,31 @@ def test_parse_ingredient():
     assert parsed[1]["ingredient_normalized"] == "clavulanic acid"
     assert parsed[1]["strength_amount"] == "125"
     assert parsed[1]["strength_unit"] == "mg"
+
+
+def test_normalize_query_tokenizer():
+    norm_str, tokens = normalize_query("dolo650")
+    assert norm_str == "dolo 650"
+    assert tokens == ["dolo", "650"]
+
+    norm_str, tokens = normalize_query("augmentin 625mg")
+    assert norm_str == "augmentin 625"
+    assert tokens == ["augmentin", "625"]
+
+    norm_str, tokens = normalize_query("p_n")
+    assert norm_str == "p n"
+    assert tokens == ["p", "n"]
+
+    norm_str, tokens = normalize_query("%")
+    assert norm_str == ""
+    assert tokens == []
+
+    norm_str, tokens = normalize_query("tab paracetamol")
+    assert norm_str == "tablet paracetamol"
+    assert tokens == ["tablet", "paracetamol"]
+
+
+def test_escape_like():
+    assert escape_like("p_n") == "p\\_n"
+    assert escape_like("100%") == "100\\%"
+    assert escape_like("normal") == "normal"

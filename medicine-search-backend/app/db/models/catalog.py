@@ -10,13 +10,15 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
-    text,
     func,
 )
-from sqlalchemy.dialects.postgresql import UUID, JSONB
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.dialects.postgresql import UUID, JSONB, TSVECTOR
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+
+# Cross-dialect tsvector type: TSVECTOR on PostgreSQL, TEXT on SQLite fallback
+TSVectorType = Text().with_variant(TSVECTOR, "postgresql")
 
 
 class CatalogSource(Base):
@@ -89,12 +91,15 @@ class Medicine(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     source_id: Mapped[str] = mapped_column(
-        String(64), nullable=False, index=True
+        String(64), nullable=False
     )  # original ID from dataset
     name: Mapped[str] = mapped_column(String(512), nullable=False)
     name_normalized: Mapped[str] = mapped_column(
-        String(512), nullable=False, index=True
+        String(512), nullable=False
     )
+    name_clean: Mapped[str | None] = mapped_column(Text)
+    brand: Mapped[str | None] = mapped_column(String(255))
+    form: Mapped[str | None] = mapped_column(String(64))
     price: Mapped[float | None] = mapped_column(Numeric(10, 2))
     is_discontinued: Mapped[bool] = mapped_column(Boolean, default=False)
     manufacturer_name: Mapped[str | None] = mapped_column(String(512))
@@ -105,6 +110,11 @@ class Medicine(Base):
     short_composition2: Mapped[str | None] = mapped_column(Text)
     composition_normalized: Mapped[str | None] = mapped_column(Text)
     salt_composition: Mapped[str | None] = mapped_column(Text)
+    name_ts: Mapped[str | None] = mapped_column(TSVectorType)
+    comp_ts: Mapped[str | None] = mapped_column(TSVectorType)
+    mfr_ts: Mapped[str | None] = mapped_column(TSVectorType)
+    all_ts: Mapped[str | None] = mapped_column(TSVectorType)
+    selection_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     catalog_version_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("catalog_versions.id")
     )
@@ -121,14 +131,18 @@ class Medicine(Base):
         onupdate=datetime.utcnow,
     )
 
-    # Indexes for search - defined in __table_args__
+    # Search & Ranking Indexes (Section 4)
     __table_args__ = (
         Index(
-            "idx_medicine_name_trgm",
-            "name_normalized",
-            postgresql_using="gin",
-            postgresql_ops={"name_normalized": "gin_trgm_ops"},
+            "idx_medicines_name_clean",
+            "name_clean",
+            postgresql_ops={"name_clean": "text_pattern_ops"},
         ),
+        Index("idx_medicines_brand_discontinued", "brand", "is_discontinued"),
+        Index("idx_medicines_name_ts", "name_ts", postgresql_using="gin"),
+        Index("idx_medicines_comp_ts", "comp_ts", postgresql_using="gin"),
+        Index("idx_medicines_all_ts", "all_ts", postgresql_using="gin"),
+        Index("idx_medicines_selection_count", "selection_count"),
         Index(
             "idx_medicine_manufacturer_trgm",
             "manufacturer_normalized",
@@ -142,6 +156,30 @@ class Medicine(Base):
             postgresql_ops={"composition_normalized": "gin_trgm_ops"},
         ),
         Index("idx_medicine_discontinued", "is_discontinued"),
+    )
+
+
+class BrandLex(Base):
+    __tablename__ = "brand_lex"
+
+    word: Mapped[str] = mapped_column(String(255), primary_key=True)
+    cnt: Mapped[int] = mapped_column(Integer, default=1)
+
+    __table_args__ = (
+        Index("idx_brand_lex_pattern", "word", postgresql_ops={"word": "text_pattern_ops"}),
+        Index("idx_brand_lex_trgm", "word", postgresql_using="gin", postgresql_ops={"word": "gin_trgm_ops"}),
+    )
+
+
+class IngredientLex(Base):
+    __tablename__ = "ingredient_lex"
+
+    word: Mapped[str] = mapped_column(String(255), primary_key=True)
+    df: Mapped[int] = mapped_column(Integer, default=1)
+
+    __table_args__ = (
+        Index("idx_ingredient_lex_pattern", "word", postgresql_ops={"word": "text_pattern_ops"}),
+        Index("idx_ingredient_lex_trgm", "word", postgresql_using="gin", postgresql_ops={"word": "gin_trgm_ops"}),
     )
 
 
@@ -177,7 +215,7 @@ class MedicineAlias(Base):
     alias_normalized: Mapped[str] = mapped_column(String(512), nullable=False)
     alias_type: Mapped[str] = mapped_column(
         String(32), default="source_name"
-    )  # source_name, approved_spelling, brand_alias, shop_alias
+    )  # source_name, approved_spelling, brand_alias, shop_alias, usage_learned
     provenance: Mapped[str | None] = mapped_column(Text)
     review_status: Mapped[str] = mapped_column(String(32), default="pending")
     created_at: Mapped[datetime] = mapped_column(
@@ -191,4 +229,47 @@ class MedicineAlias(Base):
             postgresql_using="gin",
             postgresql_ops={"alias_normalized": "gin_trgm_ops"},
         ),
+    )
+
+
+class SearchSelection(Base):
+    """User billing selection feedback events for usage-based ranking (Phase 4)."""
+    __tablename__ = "search_selections"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    query_text: Mapped[str] = mapped_column(String(255), nullable=False)
+    query_normalized: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    medicine_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("medicines.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    shop_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    rank_selected: Mapped[int] = mapped_column(Integer, default=1)
+    selected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+class ShopInventory(Base):
+    """Shop-specific inventory stocks and custom pricing (Phase 4)."""
+    __tablename__ = "shop_inventory"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    shop_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    medicine_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("medicines.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    quantity: Mapped[int] = mapped_column(Integer, default=0)
+    is_in_stock: Mapped[bool] = mapped_column(Boolean, default=True)
+    custom_price: Mapped[float | None] = mapped_column(Numeric(10, 2))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=datetime.utcnow
+    )
+
+    __table_args__ = (
+        Index("idx_shop_inventory_shop_medicine", "shop_id", "medicine_id", unique=True),
+        Index("idx_shop_inventory_shop_stock", "shop_id", "is_in_stock"),
     )

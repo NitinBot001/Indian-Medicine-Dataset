@@ -44,3 +44,7 @@ wheels/
 
 # Docker volume data
 pgdata/
+
+# Benchmark artifacts
+benchmark_*.json
+ci_benchmark_results.json

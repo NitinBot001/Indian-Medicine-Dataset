@@ -1,10 +1,97 @@
 """
 Text normalization utilities for medicine search.
-Implements conservative normalization per plan.md Section 6.
+Implements conservative normalization per plan.md Section 6 and Section 3.1.
 """
 
 import re
 import unicodedata
+
+# Common pharmaceutical form synonyms (expanded per Section 3.1)
+FORM_SYNONYMS: dict[str, str] = {
+    "tab": "tablet",
+    "cap": "capsule",
+    "syp": "syrup",
+    "inj": "injection",
+    "susp": "suspension",
+    "oint": "ointment",
+}
+
+# Bare unit tokens to drop from search queries (Section 3.1)
+UNIT_TOKENS: set[str] = {
+    "mg",
+    "ml",
+    "mcg",
+    "gm",
+    "gms",
+    "g",
+    "iu",
+    "mm",
+    "cm",
+    "l",
+    "kg",
+}
+
+
+def escape_like(text: str) -> str:
+    """
+    Escape SQL LIKE wildcard characters ('%' and '_') to prevent wildcard injection (F9).
+    """
+    if not text:
+        return ""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def normalize_query(query: str | None) -> tuple[str, list[str]]:
+    """
+    Query understanding and tokenizer per Section 3.1:
+    - Unicode NFKC normalization and lowercase.
+    - Tokens only [a-z0-9] and decimal numbers (removes LIKE wildcards % and _).
+    - Split glued letters and digits (e.g. 'dolo650' -> 'dolo 650').
+    - Drop bare unit tokens (mg, ml, mcg, gm, iu, etc.).
+    - Expand form synonyms (tab -> tablet, cap -> capsule, etc.).
+    - Maximum 8 tokens and 64 characters.
+
+    Returns:
+        tuple of (normalized_query_string, token_list)
+    """
+    if not query:
+        return "", []
+
+    # 1. Unicode NFKC normalization + lowercase
+    text = unicodedata.normalize("NFKC", str(query)).lower()
+
+    # 2. Split glued letters and digits: "dolo650" -> "dolo 650", "625duo" -> "625 duo"
+    text = re.sub(r"([a-z])(\d)", r"\1 \2", text)
+    text = re.sub(r"(\d)([a-z])", r"\1 \2", text)
+
+    # 3. Strip LIKE wildcards and non-alphanumeric chars (keep spaces and decimal dots between digits)
+    text = re.sub(r"[^a-z0-9.]", " ", text)
+    # Remove standalone dots or non-decimal dots
+    text = re.sub(r"(?<!\d)\.|\.(?!\d)", " ", text)
+
+    # 4. Tokenize and clean
+    raw_tokens = text.split()
+    clean_tokens: list[str] = []
+
+    for t in raw_tokens:
+        # Drop bare unit tokens
+        if t in UNIT_TOKENS:
+            continue
+        # Expand form synonyms
+        if t in FORM_SYNONYMS:
+            t = FORM_SYNONYMS[t]
+        clean_tokens.append(t)
+
+    # 5. Cap at 8 tokens
+    clean_tokens = clean_tokens[:8]
+
+    # 6. Build normalized string and cap at 64 characters
+    norm_str = " ".join(clean_tokens)
+    if len(norm_str) > 64:
+        norm_str = norm_str[:64].rstrip()
+        clean_tokens = norm_str.split()
+
+    return norm_str, clean_tokens
 
 
 def normalize_text(text: str | None) -> str:

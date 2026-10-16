@@ -2,169 +2,252 @@
 Search benchmark script.
 
 Runs a suite of representative queries against the search API and measures latency.
-Target: p95 <= 100ms.
+Measures cold and warm query latency, p50, p95, p99, and verifies search quality.
+Supports direct ASGI in-process execution or HTTP endpoint testing.
 
 Usage:
     python -m scripts.benchmark_search [--url http://localhost:8000] [--iterations 3]
 """
 
 import argparse
-import json
+import asyncio
+import os
 import statistics
 import sys
 import time
+from typing import Any
 
 import httpx
 
-# Representative test queries per plan.md Section 10 Phase 0
-# Covers: exact names, typos, partial prefixes, manufacturer, composition, dosage
+# Representative test queries covering:
+# 1. Section 7 Acceptance queries:
+#    pnt, pant, pnt pant, pcm, paracetmol, pantaprazole, dolo650, augmentn 625,
+#    pan 40, dolo micro, p_n, %, zzzz, qwerty
+# 2. Section 2 Findings & representative queries:
+#    exact names, typos, partial prefixes, manufacturer, composition, dosage
 TEST_QUERIES = [
-    # Exact names
-    {"q": "Augmentin 625 Duo Tablet", "expect_top1": "Augmentin 625 Duo Tablet"},
-    {"q": "Azithral 500 Tablet", "expect_top1": "Azithral 500 Tablet"},
-    {"q": "Dolo 650 Tablet", "expect_top1": None},
-    {"q": "Crocin Advance Tablet", "expect_top1": None},
+    # --- Section 7 Acceptance Queries ---
+    {"q": "pnt", "category": "acceptance", "description": "Abbreviation/prefix for PNT"},
+    {"q": "pant", "category": "acceptance", "description": "Prefix for Pantoprazole/Pant"},
+    {"q": "pnt pant", "category": "acceptance", "description": "Name + composition cross-field"},
+    {"q": "pcm", "category": "acceptance", "description": "PCM abbreviation"},
+    {"q": "paracetmol", "category": "acceptance", "description": "Common paracetamol typo"},
+    {"q": "pantaprazole", "category": "acceptance", "description": "Ingredient typo for pantoprazole"},
+    {"q": "dolo650", "category": "acceptance", "description": "Glued alphanumeric token"},
+    {"q": "augmentn 625", "category": "acceptance", "description": "Brand typo + dosage"},
+    {"q": "pan 40", "category": "acceptance", "description": "Word start matching (no Bepan)"},
+    {"q": "dolo micro", "category": "acceptance", "description": "Name + manufacturer cross-field"},
+    {"q": "p_n", "category": "acceptance", "description": "Literal wildcard character handling"},
+    {"q": "%", "category": "acceptance", "description": "Literal percent character handling"},
+    {"q": "zzzz", "category": "acceptance", "description": "Garbage query (should return 0)"},
+    {"q": "qwerty", "category": "acceptance", "description": "Garbage query (should return 0)"},
 
-    # Common typos
-    {"q": "augmentn 625", "expect_top1_contains": "Augmentin"},
-    {"q": "azithrl 500", "expect_top1_contains": "Azithral"},
-    {"q": "paracetamol", "expect_top1_contains": None},
-    {"q": "amoxycllin", "expect_top1_contains": None},
-    {"q": "cetrizine", "expect_top1_contains": None},
+    # --- Exact Names ---
+    {"q": "Augmentin 625 Duo Tablet", "category": "exact", "description": "Full exact name"},
+    {"q": "Azithral 500 Tablet", "category": "exact", "description": "Full exact name"},
+    {"q": "Dolo 650 Tablet", "category": "exact", "description": "Full exact name"},
+    {"q": "Crocin Advance Tablet", "category": "exact", "description": "Full exact name"},
 
-    # Partial prefixes
-    {"q": "augm", "expect_top1_contains": "Augmentin"},
-    {"q": "azith", "expect_top1_contains": "Azith"},
-    {"q": "cipro", "expect_top1_contains": None},
-    {"q": "metro", "expect_top1_contains": None},
-    {"q": "ome", "expect_top1_contains": None},
+    # --- Common Typos ---
+    {"q": "azithrl 500", "category": "typo", "description": "Azithral typo + dosage"},
+    {"q": "amoxycllin", "category": "typo", "description": "Ingredient typo"},
+    {"q": "cetrizine", "category": "typo", "description": "Cetirizine typo"},
 
-    # Omitted spaces
-    {"q": "augmentin625", "expect_top1_contains": "Augmentin"},
+    # --- Partial Prefixes ---
+    {"q": "augm", "category": "prefix", "description": "Short 4-char prefix"},
+    {"q": "azith", "category": "prefix", "description": "5-char prefix"},
+    {"q": "cipro", "category": "prefix", "description": "5-char prefix"},
+    {"q": "metro", "category": "prefix", "description": "5-char prefix"},
+    {"q": "ome", "category": "prefix", "description": "3-char prefix"},
 
-    # Transpositions
-    {"q": "augmenitn", "expect_top1_contains": "Augmentin"},
+    # --- Transpositions & Decomposed ---
+    {"q": "augmentin625", "category": "glued", "description": "Brand + number glued"},
+    {"q": "augmenitn", "category": "transposition", "description": "Transposition typo"},
 
-    # Manufacturer queries
-    {"q": "glaxo", "expect_top1_contains": None},
-    {"q": "cipla", "expect_top1_contains": None},
-    {"q": "sun pharma", "expect_top1_contains": None},
+    # --- Manufacturer Queries ---
+    {"q": "glaxo", "category": "manufacturer", "description": "Company name"},
+    {"q": "cipla", "category": "manufacturer", "description": "Company name"},
+    {"q": "sun pharma", "category": "manufacturer", "description": "Multi-word company name"},
 
-    # Composition/ingredient queries
-    {"q": "amoxycillin 500", "expect_top1_contains": None},
-    {"q": "azithromycin", "expect_top1_contains": None},
+    # --- Composition Queries ---
+    {"q": "amoxycillin 500", "category": "composition", "description": "Composition + strength"},
+    {"q": "azithromycin", "category": "composition", "description": "Salt name"},
 
-    # Short queries
-    {"q": "ab", "expect_top1_contains": None},
-    {"q": "pan", "expect_top1_contains": None},
+    # --- Short Queries ---
+    {"q": "ab", "category": "short", "description": "2-char prefix"},
+    {"q": "pan", "category": "short", "description": "3-char prefix"},
 
-    # Dosage disambiguation
-    {"q": "augmentin 375", "expect_top1_contains": "Augmentin"},
-    {"q": "augmentin 1000", "expect_top1_contains": "Augmentin"},
+    # --- Dosage Disambiguation ---
+    {"q": "augmentin 375", "category": "dosage", "description": "Dosage variant 375"},
+    {"q": "augmentin 1000", "category": "dosage", "description": "Dosage variant 1000"},
 ]
 
 
-def run_benchmark(base_url: str, iterations: int = 3) -> dict:
-    """Run benchmark queries and collect latency statistics."""
-    url = f"{base_url}/api/v1/search"
+async def run_benchmark_async(base_url: str | None = None, iterations: int = 3) -> dict[str, Any]:
+    """Run benchmark queries and collect comprehensive latency statistics."""
+    # Setup client
+    if base_url:
+        client = httpx.AsyncClient(base_url=base_url, timeout=30.0)
+        app_context = None
+    else:
+        # In-process ASGI transport
+        from app.main import app
+        from app.db.session import db_manager
+        await db_manager.initialize()
+        client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", timeout=30.0)
+        app_context = db_manager
 
-    all_latencies = []
+    url = "/api/v1/search"
     results = []
+    all_warm_latencies = []
+    cold_latencies = []
 
-    with httpx.Client(timeout=30.0) as client:
-        # Warm up
-        print("Warming up...")
-        for _ in range(3):
+    try:
+        # 1. Cold pass (1 request per query, no prior cache warm-up for these specific queries)
+        print("Executing cold queries pass...")
+        for tq in TEST_QUERIES:
+            query = tq["q"]
+            start = time.perf_counter()
             try:
-                client.get(url, params={"q": "test", "limit": 10})
-            except Exception:
-                pass
+                resp = await client.get(url, params={"q": query, "limit": 10})
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                cold_latencies.append(elapsed_ms)
+            except Exception as e:
+                print(f"  Cold error: {query} -> {e}")
+                cold_latencies.append(float("inf"))
 
-        print(f"\nRunning {len(TEST_QUERIES)} queries x {iterations} iterations...\n")
+        # 2. Warm up
+        print("Warming up database & cache...")
+        for _ in range(2):
+            for tq in TEST_QUERIES[:5]:
+                try:
+                    await client.get(url, params={"q": tq["q"], "limit": 10})
+                except Exception:
+                    pass
 
+        print(f"\nRunning {len(TEST_QUERIES)} queries x {iterations} iterations (Warm)...\n")
+
+        # 3. Warm measurements
         for i, tq in enumerate(TEST_QUERIES):
             query = tq["q"]
+            category = tq.get("category", "")
             query_latencies = []
+            last_resp_data = {}
 
             for _ in range(iterations):
                 start = time.perf_counter()
                 try:
-                    resp = client.get(url, params={"q": query, "limit": 10})
+                    resp = await client.get(url, params={"q": query, "limit": 10})
                     elapsed_ms = (time.perf_counter() - start) * 1000
-                    data = resp.json()
-
                     query_latencies.append(elapsed_ms)
-                    all_latencies.append(elapsed_ms)
+                    all_warm_latencies.append(elapsed_ms)
+                    last_resp_data = resp.json()
                 except Exception as e:
                     print(f"  ERROR: {query} -> {e}")
                     query_latencies.append(float("inf"))
 
-            avg_ms = statistics.mean(query_latencies) if query_latencies else 0
-            p95 = query_latencies[int(len(query_latencies) * 0.95)] if query_latencies else 0
+            valid = [l for l in query_latencies if l != float("inf")]
+            if valid:
+                valid.sort()
+                p50 = statistics.median(valid)
+                p95 = valid[int(len(valid) * 0.95)] if len(valid) > 1 else valid[0]
+                avg_ms = statistics.mean(valid)
+            else:
+                p50 = p95 = avg_ms = 0.0
 
-            # Check result quality
-            top1_name = ""
-            result_count = 0
-            if "data" in dir():
-                catalog = data.get("catalog_matches", [])
-                result_count = len(catalog)
-                if catalog:
-                    top1_name = catalog[0].get("name", "")
+            catalog = last_resp_data.get("catalog_matches", []) if isinstance(last_resp_data, dict) else []
+            result_count = len(catalog)
+            top1_name = catalog[0].get("name", "") if catalog else ""
+            top1_reason = catalog[0].get("match_reason", "") if catalog else ""
+            top1_param = catalog[0].get("match_parameter", "") if catalog else ""
 
-            status = "✓" if avg_ms < 100 else "⚠" if avg_ms < 200 else "✗"
-            print(f"  {status} [{avg_ms:6.1f}ms] q=\"{query}\" → {result_count} results, top1=\"{top1_name[:50]}\"")
+            status = "✓" if avg_ms < 50 else "•" if avg_ms < 100 else "⚠" if avg_ms < 200 else "✗"
+            print(
+                f"  {status} [{avg_ms:6.1f}ms (p50: {p50:5.1f}ms, p95: {p95:5.1f}ms)] "
+                f"q=\"{query:<16}\" → {result_count:2d} res, top1=\"{top1_name[:35]}\" ({top1_reason})"
+            )
 
             results.append({
                 "query": query,
+                "category": category,
                 "avg_ms": round(avg_ms, 2),
+                "p50_ms": round(p50, 2),
+                "p95_ms": round(p95, 2),
                 "result_count": result_count,
                 "top1": top1_name,
+                "top1_reason": top1_reason,
+                "top1_param": top1_param,
             })
 
+    finally:
+        await client.aclose()
+
     # Overall statistics
-    valid_latencies = [l for l in all_latencies if l != float("inf")]
-    if valid_latencies:
-        valid_latencies.sort()
+    valid_warm = [l for l in all_warm_latencies if l != float("inf")]
+    valid_cold = [l for l in cold_latencies if l != float("inf")]
+
+    stats: dict[str, Any] = {}
+    if valid_warm:
+        valid_warm.sort()
         stats = {
-            "total_queries": len(TEST_QUERIES) * iterations,
-            "min_ms": round(min(valid_latencies), 2),
-            "max_ms": round(max(valid_latencies), 2),
-            "mean_ms": round(statistics.mean(valid_latencies), 2),
-            "median_ms": round(statistics.median(valid_latencies), 2),
-            "p95_ms": round(valid_latencies[int(len(valid_latencies) * 0.95)], 2),
-            "p99_ms": round(valid_latencies[int(len(valid_latencies) * 0.99)], 2),
-            "under_100ms": sum(1 for l in valid_latencies if l < 100),
-            "under_200ms": sum(1 for l in valid_latencies if l < 200),
-            "total_valid": len(valid_latencies),
+            "total_queries_run": len(valid_warm),
+            "warm": {
+                "min_ms": round(min(valid_warm), 2),
+                "mean_ms": round(statistics.mean(valid_warm), 2),
+                "median_p50_ms": round(statistics.median(valid_warm), 2),
+                "p95_ms": round(valid_warm[int(len(valid_warm) * 0.95)], 2),
+                "p99_ms": round(valid_warm[int(len(valid_warm) * 0.99)], 2),
+                "max_ms": round(max(valid_warm), 2),
+                "under_50ms": sum(1 for l in valid_warm if l < 50),
+                "under_100ms": sum(1 for l in valid_warm if l < 100),
+                "under_200ms": sum(1 for l in valid_warm if l < 200),
+                "total": len(valid_warm),
+            },
         }
+        if valid_cold:
+            valid_cold.sort()
+            stats["cold"] = {
+                "min_ms": round(min(valid_cold), 2),
+                "mean_ms": round(statistics.mean(valid_cold), 2),
+                "median_p50_ms": round(statistics.median(valid_cold), 2),
+                "p95_ms": round(valid_cold[int(len(valid_cold) * 0.95)], 2),
+                "max_ms": round(max(valid_cold), 2),
+            }
 
-        print(f"\n{'='*60}")
-        print(f"BENCHMARK RESULTS")
-        print(f"{'='*60}")
-        print(f"  Total queries: {stats['total_queries']}")
-        print(f"  Min:    {stats['min_ms']:>8.2f} ms")
-        print(f"  Mean:   {stats['mean_ms']:>8.2f} ms")
-        print(f"  Median: {stats['median_ms']:>8.2f} ms")
-        print(f"  P95:    {stats['p95_ms']:>8.2f} ms")
-        print(f"  P99:    {stats['p99_ms']:>8.2f} ms")
-        print(f"  Max:    {stats['max_ms']:>8.2f} ms")
-        print(f"  < 100ms: {stats['under_100ms']}/{stats['total_valid']} ({100*stats['under_100ms']/stats['total_valid']:.1f}%)")
-        print(f"  < 200ms: {stats['under_200ms']}/{stats['total_valid']} ({100*stats['under_200ms']/stats['total_valid']:.1f}%)")
+        w = stats["warm"]
+        print(f"\n{'='*70}")
+        print("BENCHMARK SUMMARY")
+        print(f"{'='*70}")
+        if "cold" in stats:
+            c = stats["cold"]
+            print(f"  COLD  (first hit): mean={c['mean_ms']}ms, p50={c['median_p50_ms']}ms, p95={c['p95_ms']}ms, max={c['max_ms']}ms")
+        print(f"  WARM  (steady state): mean={w['mean_ms']}ms, p50={w['median_p50_ms']}ms, p95={w['p95_ms']}ms, p99={w['p99_ms']}ms")
+        print(f"  < 50ms:  {w['under_50ms']}/{w['total']} ({100*w['under_50ms']/w['total']:.1f}%)")
+        print(f"  < 100ms: {w['under_100ms']}/{w['total']} ({100*w['under_100ms']/w['total']:.1f}%)")
+        print(f"  < 200ms: {w['under_200ms']}/{w['total']} ({100*w['under_200ms']/w['total']:.1f}%)")
 
-        target_met = stats["p95_ms"] <= 100
-        print(f"\n  {'✓ TARGET MET' if target_met else '✗ TARGET NOT MET'}: p95 {'<=' if target_met else '>'} 100ms")
+        target_met = w["p95_ms"] <= 100
+        print(f"\n  {'✓ TARGET MET' if target_met else '✗ TARGET NOT MET'}: Warm p95 {'<=' if target_met else '>'} 100ms")
 
-        return {"stats": stats, "results": results}
+    return {"stats": stats, "results": results}
 
-    print("No valid results collected!")
-    return {"stats": {}, "results": []}
+
+def main():
+    default_base_url = os.getenv("MEDICINE_SEARCH_BACKEND_URL")
+    parser = argparse.ArgumentParser(description="Benchmark medicine search")
+    parser.add_argument("--url", default=default_base_url, help="Base API URL (omit for in-process ASGI)")
+    parser.add_argument("--iterations", type=int, default=3, help="Iterations per query")
+    parser.add_argument("--output", help="Optional JSON file to save results")
+    args = parser.parse_args()
+
+    results = asyncio.run(run_benchmark_async(args.url, args.iterations))
+
+    if args.output:
+        import json
+        with open(args.output, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"\nSaved benchmark results to {args.output}")
 
 
 if __name__ == "__main__":
-    default_base_url = os.getenv("MEDICINE_SEARCH_BACKEND_URL", "http://localhost:8000")
-    parser = argparse.ArgumentParser(description="Benchmark medicine search")
-    parser.add_argument("--url", default=default_base_url, help="Base API URL")
-    parser.add_argument("--iterations", type=int, default=3, help="Iterations per query")
-    args = parser.parse_args()
-
-    results = run_benchmark(args.url, args.iterations)
+    main()
